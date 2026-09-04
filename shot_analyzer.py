@@ -1727,7 +1727,7 @@ def build_feedback(ds: ShotDataset) -> List[str]:
 BLUE_RED = [[0.0, "#2563EB"], [0.5, "#9CA3AF"], [1.0, "#DC2626"]]
 
 
-def _style(fig: "go.Figure", title: str, h: int = 300) -> "go.Figure":
+def _style(fig: "go.Figure", title: str, h: int = 340) -> "go.Figure":
     fig.update_layout(
         title=dict(text=title, font=dict(size=14, color=PLOT_FONT), x=0.01, xanchor="left"),
         height=h,
@@ -1812,7 +1812,7 @@ def fig_heatmap(ds: ShotDataset) -> "go.Figure":
     fig.update_xaxes(range=[-0.4, COURT["COURT_WIDTH"] + 0.4], showgrid=False, title_text="球场横向位置（米）")
     fig.update_yaxes(range=[-0.4, COURT["COURT_HALF_LEN"] * 0.62], showgrid=False,
                      scaleanchor="x", scaleratio=1, title_text="距底线纵深（米）")
-    return _style(fig, "出手位置热力图", 320)
+    return _style(fig, "出手位置热力图", 360)
 
 
 def fig_cumulative(ds: ShotDataset) -> "go.Figure":
@@ -2109,22 +2109,25 @@ def _chart(fig, key: str) -> None:
         return
     cfg = {"displaylogo": False, "scrollZoom": True, "responsive": True,
            "modeBarButtonsToRemove": ["lasso2d", "select2d"]}
-    fig.update_layout(autosize=True)
+    # 保留图本身设定的宽高，组件容器给足空间；对含比例约束的热力图尤为重要
+    fig.update_layout(autosize=False)
     fig_json = fig.to_json()
     uid = "".join(c if c.isalnum() or c in "_-" else "_" for c in key) + "_" + uuid.uuid4().hex[:6]
     cdn = "https://cdnjs.cloudflare.com/ajax/libs/plotly.js/4.0.0/plotly.min.js"
     html = f"""
-    <div id="{uid}" style="width:100%; height:360px;"></div>
+    <div id="{uid}" style="width:100%; height:400px;"></div>
     <script src="{cdn}"></script>
     <script>
       (function(){{
         var fig = {fig_json};
         fig.config = {json.dumps(cfg)};
+        var el = document.getElementById("{uid}");
         Plotly.newPlot("{uid}", fig.data, fig.layout, fig.config);
+        window.addEventListener("resize", function(){{ Plotly.Plots.resize(el); }});
       }})();
     </script>
     """
-    st.components.v1.html(html, height=360)
+    st.components.v1.html(html, height=400)
 
 
 def run_dashboard() -> None:
