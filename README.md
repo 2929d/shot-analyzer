@@ -15,7 +15,7 @@ python shot_analyzer.py          # 或: streamlit run shot_analyzer.py
 ## 部署到 Streamlit Cloud（公网）
 
 1. 把本仓库推送到 GitHub 公开仓库；
-2. 打开 https://share.streamlit.io → 用 GitHub 登录 → New app；
+2. 打开 https://streamlit.io/cloud → 用 GitHub 登录 → New app；
 3. 选仓库 / 分支 / 主文件 `shot_analyzer.py` → Deploy；
 4. 得到公网链接（如 `xxx.streamlit.app`）。
 

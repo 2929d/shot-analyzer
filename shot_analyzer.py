@@ -9,7 +9,7 @@
     streamlit run shot_analyzer.py     # 直接用 streamlit 启动
 
 依赖（缺一不可）：pip install streamlit plotly numpy scipy
-可选（装上后启用真实视频/姿态能力）：pip install opencv-python mediapipe
+可选（装上后启用真实视频/姿态能力）：pip install opencv-python-headless mediapipe
 
 设计约定：
   * 所有物理与算法集中在第 2~6 节的独立类/函数中，第 8 节起的前端只负责展示。
@@ -1429,7 +1429,7 @@ class VideoShotPipeline:
     def process(self, data: bytes, progress: Optional[Callable[[float, str], None]] = None
                 ) -> Tuple[List[ShotRecord], Dict[str, float]]:
         if not CV2_OK:
-            raise RuntimeError("未安装 opencv-python，无法解析视频")
+            raise RuntimeError("未安装 opencv-python-headless，无法解析视频")
 
         tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_upload.mp4")
         with open(tmp, "wb") as f:
@@ -2138,15 +2138,16 @@ def run_dashboard() -> None:
     ss.setdefault("meta", {})
 
     # ---------------- 顶部交互区 ----------------
-    c1, c2, c3, c4 = st.columns([3.0, 1.0, 1.1, 1.5], gap="small")
+    # 上传器单独一行，避免大文件上传后把按钮挤到屏幕外
+    up = st.file_uploader("上传投篮视频（支持 MP4 / MOV / AVI）",
+                          type=["mp4", "mov", "avi", "m4v"],
+                          label_visibility="visible")
+    c1, c2, c3 = st.columns([1.0, 1.0, 2.0], gap="small")
     with c1:
-        up = st.file_uploader("上传投篮视频（支持 MP4 / MOV）", type=["mp4", "mov", "avi", "m4v"],
-                              label_visibility="visible")
+        run_btn = st.button("开始分析", use_container_width=True, type="primary")
     with c2:
-        run_btn = st.button("开始分析", use_container_width=True)
-    with c3:
         demo_toggle = st.toggle("模拟数据演示", value=(ss["records"] is None))
-    with c4:
+    with c3:
         meta_txt = ""
         frame_ms = float(ss["meta"].get("frame_ms", 0.0) or 0.0)
         if frame_ms > 0:
