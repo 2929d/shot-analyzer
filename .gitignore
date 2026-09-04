@@ -1,0 +1,7 @@
+.workbuddy/
+__pycache__/
+*.pyc
+.DS_Store
+calibration.json
+*.mp4
+*.mov
