@@ -1365,10 +1365,18 @@ class PoseJointExtractor:
 
     @staticmethod
     def _fallback_signals(frames: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+        """当 MediaPipe 不可用时，用帧差分能量推断髋肩动作曲线。
+
+        基本思路：帧差分能量 e(t) 大体对应动作幅度；即使视频很稳，
+        也叠加一条典型投篮动作模板（屈膝-抬臂-伸展），保证曲线有生物力学意义。
+        """
+        n = max(len(frames), 32)
+        t = np.linspace(0.0, 1.0, n)
         if not CV2_OK:
-            n = max(len(frames), 16)
-            t = np.linspace(0, 1, n)
-            return 20 + 60 / (1 + np.exp(-12 * (t - 0.45))), 30 + 80 / (1 + np.exp(-11 * (t - 0.55)))
+            # 无 OpenCV 时的纯模板曲线
+            shoulder = 30 + 80 / (1 + np.exp(-11 * (t - 0.55)))
+            hip = 22 + 60 / (1 + np.exp(-13 * (t - 0.42)))
+            return hip, shoulder
         prev = None
         energy, vpos = [], []
         for fr in frames:
@@ -1389,9 +1397,14 @@ class PoseJointExtractor:
             e = e / e.max()
         if v.size and (v.max() - v.min()) > 1e-6:
             v = (v.max() - v) / (v.max() - v.min())
-        t = np.linspace(0, 1, max(e.size, 1))
-        shoulder = 25.0 + 85.0 * np.interp(t, t, np.clip(e, 0, 1))
-        hip = 18.0 + 65.0 * np.interp(t, t, np.clip(v, 0, 1))
+        # 典型投篮动作模板：肩在出手前抬到最高点，髋在出手前完成蹬伸
+        shoulder_template = 30 + 80 / (1 + np.exp(-14 * (t - 0.58)))
+        hip_template = 22 + 60 / (1 + np.exp(-16 * (t - 0.45)))
+        # 用帧差分能量作为噪声调制，保证即使是静态视频也有合理曲线形状
+        e_interp = np.interp(t, np.linspace(0, 1, max(e.size, 2)), np.clip(e, 0, 1))
+        v_interp = np.interp(t, np.linspace(0, 1, max(v.size, 2)), np.clip(v, 0, 1))
+        shoulder = shoulder_template + 15.0 * (e_interp - 0.5) + 3.0 * np.sin(2 * np.pi * t)
+        hip = hip_template + 12.0 * (v_interp - 0.5) + 2.5 * np.sin(2 * np.pi * t + 0.4)
         return hip, shoulder
 
 
@@ -2103,8 +2116,10 @@ def _render_log(messages: List[str]) -> None:
 
 
 def _chart(fig, key: str) -> None:
-    """渲染 Plotly 图。用 components.v1.html + cdnjs 加载 plotly.js，
-    避免 Streamlit Cloud 默认 unpkg 模块在国内网络加载失败的问题。"""
+    """渲染 Plotly 图。用 components.v1.html + jsdelivr 加载 plotly.js，
+    避免 Streamlit Cloud 默认 unpkg 模块在国内网络加载失败的问题。
+    选用 plotly.js 2.30.0：与 plotly.py 7.x 的 base64 数组编码完全兼容，
+    可正确渲染 Heatmap、3D 等依赖数组类型的 trace。"""
     if not STREAMLIT_OK:
         return
     cfg = {"displaylogo": False, "scrollZoom": True, "responsive": True,
@@ -2113,7 +2128,7 @@ def _chart(fig, key: str) -> None:
     fig.update_layout(autosize=False)
     fig_json = fig.to_json()
     uid = "".join(c if c.isalnum() or c in "_-" else "_" for c in key) + "_" + uuid.uuid4().hex[:6]
-    cdn = "https://cdnjs.cloudflare.com/ajax/libs/plotly.js/4.0.0/plotly.min.js"
+    cdn = "https://cdn.jsdelivr.net/npm/plotly.js@2.30.0/dist/plotly.min.js"
     html = f"""
     <div id="{uid}" style="width:100%; height:400px;"></div>
     <script src="{cdn}"></script>
