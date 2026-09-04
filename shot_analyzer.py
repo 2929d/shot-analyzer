@@ -27,6 +27,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
+import uuid
 
 import numpy as np
 
@@ -2100,12 +2101,28 @@ def _render_log(messages: List[str]) -> None:
 
 
 def _chart(fig, key: str) -> None:
-    cfg = {"displaylogo": False, "scrollZoom": True,
+    """渲染 Plotly 图。用 components.v1.html + cdnjs 加载 plotly.js，
+    避免 Streamlit Cloud 默认 unpkg 模块在国内网络加载失败的问题。"""
+    if not STREAMLIT_OK:
+        return
+    cfg = {"displaylogo": False, "scrollZoom": True, "responsive": True,
            "modeBarButtonsToRemove": ["lasso2d", "select2d"]}
-    try:  # streamlit >= 1.50 推荐写法
-        st.plotly_chart(fig, width="stretch", key=key, config=cfg)
-    except TypeError:  # 旧版兼容
-        st.plotly_chart(fig, use_container_width=True, key=key, config=cfg)
+    fig.update_layout(autosize=True)
+    fig_json = fig.to_json()
+    uid = "".join(c if c.isalnum() or c in "_-" else "_" for c in key) + "_" + uuid.uuid4().hex[:6]
+    cdn = "https://cdnjs.cloudflare.com/ajax/libs/plotly.js/4.0.0/plotly.min.js"
+    html = f"""
+    <div id="{uid}" style="width:100%; height:360px;"></div>
+    <script src="{cdn}"></script>
+    <script>
+      (function(){{
+        var fig = {fig_json};
+        fig.config = {json.dumps(cfg)};
+        Plotly.newPlot("{uid}", fig.data, fig.layout, fig.config);
+      }})();
+    </script>
+    """
+    st.components.v1.html(html, height=360)
 
 
 def run_dashboard() -> None:
