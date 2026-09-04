@@ -54,13 +54,15 @@ except Exception:  # pragma: no cover
     solve_ivp = brentq = least_squares = minimize = hilbert = None
     chi2 = student_t = None
 
+CV2_ERR = ""
 try:
     import cv2
 
     CV2_OK = True
-except Exception:  # pragma: no cover
+except Exception as _e:  # pragma: no cover
     cv2 = None
     CV2_OK = False
+    CV2_ERR = str(_e)
 
 try:
     import mediapipe as mp
@@ -1429,7 +1431,7 @@ class VideoShotPipeline:
     def process(self, data: bytes, progress: Optional[Callable[[float, str], None]] = None
                 ) -> Tuple[List[ShotRecord], Dict[str, float]]:
         if not CV2_OK:
-            raise RuntimeError("未安装 opencv-python-headless，无法解析视频")
+            raise RuntimeError(f"OpenCV 导入失败：{CV2_ERR or '未安装 opencv-python-headless'}。无法解析视频。")
 
         tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_upload.mp4")
         with open(tmp, "wb") as f:
