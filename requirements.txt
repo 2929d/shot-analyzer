@@ -1,6 +1,6 @@
 streamlit>=1.30
 plotly>=5.17
-numpy>=1.24
+numpy==1.24.3
 scipy>=1.10
 opencv-python-headless==4.8.1.78
 # mediapipe 体积大且可能与 opencv 产生二进制冲突；云端使用纯回退信号，本地可选安装
