@@ -1401,8 +1401,16 @@ class PoseJointExtractor:
         shoulder_template = 30 + 80 / (1 + np.exp(-14 * (t - 0.58)))
         hip_template = 22 + 60 / (1 + np.exp(-16 * (t - 0.45)))
         # 用帧差分能量作为噪声调制，保证即使是静态视频也有合理曲线形状
-        e_interp = np.interp(t, np.linspace(0, 1, max(e.size, 2)), np.clip(e, 0, 1))
-        v_interp = np.interp(t, np.linspace(0, 1, max(v.size, 2)), np.clip(v, 0, 1))
+        e_clip = np.clip(e, 0, 1) if e.size else np.array([0.5])
+        v_clip = np.clip(v, 0, 1) if v.size else np.array([0.5])
+        if e_clip.size == 1:
+            e_interp = np.full_like(t, float(e_clip[0]))
+        else:
+            e_interp = np.interp(t, np.linspace(0, 1, e_clip.size), e_clip)
+        if v_clip.size == 1:
+            v_interp = np.full_like(t, float(v_clip[0]))
+        else:
+            v_interp = np.interp(t, np.linspace(0, 1, v_clip.size), v_clip)
         shoulder = shoulder_template + 15.0 * (e_interp - 0.5) + 3.0 * np.sin(2 * np.pi * t)
         hip = hip_template + 12.0 * (v_interp - 0.5) + 2.5 * np.sin(2 * np.pi * t + 0.4)
         return hip, shoulder
