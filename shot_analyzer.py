@@ -1450,7 +1450,10 @@ class VideoShotPipeline:
             segs.append(cur)
         return segs
 
-    def process(self, data: bytes, progress: Optional[Callable[[float, str], None]] = None
+    def process(self, data: bytes,
+                progress: Optional[Callable[[float, str], None]] = None,
+                enable_overlay: bool = True,
+                max_frames: int = 2400
                 ) -> Tuple[List[ShotRecord], Dict[str, float]]:
         if not CV2_OK:
             raise RuntimeError(f"OpenCV 导入失败：{CV2_ERR or '未安装 opencv-python-headless'}。无法解析视频。")
@@ -1469,17 +1472,21 @@ class VideoShotPipeline:
         fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
-        # ---- 叠加视频写入器：把球的轨迹 + 发力链画回画面 ----
+        # ---- 叠加视频写入器：只写有球跟踪的片段，避免整段视频逐帧编码拖慢 ----
         overlay_path = os.path.join(tempfile.gettempdir(), f"shot_overlay_{uuid.uuid4().hex}.mp4")
         vw = None
         ow = oh = 0
         recent: List[Tuple[float, float]] = []   # 归一化球心轨迹（最近 40 个）
+        last_det_idx = -1000
+        POST_WINDOW = 30   # 丢失球后仍写 30 帧（约 1s），保证动作完整
 
         detections: List[Tuple[int, float, float, float, float]] = []
         frames_buffer: List[np.ndarray] = []
         idx = 0
         t_sum, t_cnt = 0.0, 0
         while True:
+            if idx >= max_frames:
+                break
             ok, frame = cap.read()
             if not ok:
                 break
@@ -1498,26 +1505,29 @@ class VideoShotPipeline:
                 recent.append((u, v))
                 if len(recent) > 40:
                     recent.pop(0)
+                last_det_idx = idx
             if len(frames_buffer) < 240:
                 frames_buffer.append(frame)
 
-            # ---- 绘制并写入叠加帧 ----
-            if ow == 0 and fw and fh:
-                ow = min(fw, 720)
-                oh = int(fh * ow / float(fw))
-                try:
-                    vw = cv2.VideoWriter(overlay_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                         float(fps), (ow, oh))
-                except Exception:
-                    vw = None
-            if vw is not None:
-                out = cv2.resize(frame, (ow, oh))
-                self._draw_overlay(out, recent, float(idx) / max(total, 1))
-                vw.write(out)
+            # ---- 绘制并写入叠加帧（仅跟踪期间+短暂尾帧，跳过漫长等待片段）----
+            if enable_overlay and (recent or idx - last_det_idx <= POST_WINDOW):
+                if ow == 0 and fw and fh:
+                    ow = min(fw, 720)
+                    oh = int(fh * ow / float(fw))
+                    try:
+                        vw = cv2.VideoWriter(overlay_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                             float(fps), (ow, oh))
+                    except Exception:
+                        vw = None
+                if vw is not None:
+                    out = cv2.resize(frame, (ow, oh))
+                    self._draw_overlay(out, recent, float(idx) / max(total, 1))
+                    vw.write(out)
 
             idx += 1
             if progress and idx % 10 == 0:
-                progress(min(0.45, idx / max(total, 1) * 0.9), "正在追踪球体")
+                phase = "正在生成叠加视频" if enable_overlay else "正在追踪球体"
+                progress(min(0.45, idx / max(total, 1) * 0.9), phase)
         cap.release()
         if vw is not None:
             vw.release()
@@ -2377,8 +2387,18 @@ def run_dashboard() -> None:
         st.markdown(f'<div class="sect">数据来源：{ss["source"]}{meta_txt}</div>',
                     unsafe_allow_html=True)
 
+    # 叠加视频开关：关闭后不再编码叠加视频，分析速度显著加快
+    enable_overlay = st.toggle(
+        "生成发力链叠加视频（开启会慢一些）",
+        value=ss.get("enable_overlay", False),
+        key="enable_overlay",
+        help="开启时仅保留「球被跟踪到」的片段生成叠加视频；关闭则只出 9 张图，速度最快。先关闭跑通数据，需要时再开叠加视频。",
+    )
+    ss["enable_overlay"] = enable_overlay
+
     # ---------------- 数据获取 ----------------
-    if demo_toggle and (ss["records"] is None or ss["source"] == "模拟演示"):
+    # 点了「开始分析」时，不要重置为模拟数据，避免浪费计算并保证后续处理真实视频
+    if demo_toggle and not run_btn and (ss["records"] is None or ss["source"] == "模拟演示"):
         with st.spinner("正在生成模拟投篮数据"):
             ss["records"] = DemoDataFactory().generate(60)
             ss["source"] = "模拟演示"
@@ -2405,6 +2425,7 @@ def run_dashboard() -> None:
                     recs, meta = VideoShotPipeline().process(
                         data,
                         progress=lambda p, t: bar.progress((fi + p) / n, text=f"{fname}：{t}"),
+                        enable_overlay=enable_overlay,
                     )
                     all_records.extend(recs)
                     if meta.get("overlay_path") and os.path.exists(meta["overlay_path"]):
