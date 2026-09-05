@@ -2322,19 +2322,47 @@ def run_dashboard() -> None:
     ss.setdefault("source", "未加载")
     ss.setdefault("meta", {})
     ss.setdefault("video_pairs", [])
+    ss.setdefault("video_pool", [])          # 已加入分析列表的视频：[{"name":, "data":}]
+    ss.setdefault("uploader_key_idx", 0)    # 用于重置上传器（添加到列表后清空选择）
 
     # ---------------- 顶部交互区 ----------------
-    # 上传器单独一行，避免大文件上传后把按钮挤到屏幕外；支持多视频
+    # 上传器单独一行；支持反复点击「➕ 添加」逐个累加视频（避免重新打开对话框替换列表）
     up = st.file_uploader(
         "上传投篮视频（可多选，支持 MP4 / MOV / AVI）",
         type=["mp4", "mov", "avi", "m4v"],
         accept_multiple_files=True,
+        key=f"upl_{ss['uploader_key_idx']}",
         label_visibility="visible",
-        help="在弹出的文件选择框里【一次选中多个视频】：按住 Ctrl / Cmd 点选多个，"
-             "或框选 / 拖拽。注意：重新打开对话框会替换已选列表，请一次性选齐再点「开始分析」。",
+        help="选中视频后点下方的「➕ 添加」，可反复添加多个视频；也可在对话框里一次选多个。",
     )
-    if up:
-        st.caption(f"✅ 已选择 {len(up)} 个视频：{'、'.join(f.name for f in up)}")
+    add_col, clear_col = st.columns([1.0, 1.0], gap="small")
+    with add_col:
+        if st.button("➕ 添加", use_container_width=True,
+                     help="把上面选中的视频加入分析列表，可多次点击累加"):
+            if up:
+                added = 0
+                for f in up:
+                    if not any(p["name"] == f.name for p in ss["video_pool"]):
+                        ss["video_pool"].append({"name": f.name, "data": f.getvalue()})
+                        added += 1
+                if added:
+                    st.toast(f"已添加 {added} 个视频到列表")
+                else:
+                    st.toast("没有新增（可能已添加过同名文件）")
+                ss["uploader_key_idx"] += 1   # 重置上传器，方便继续添加下一个
+                st.rerun()
+            else:
+                st.toast("请先选择视频，再点「➕ 添加」")
+    with clear_col:
+        if st.button("🗑 清空列表", use_container_width=True):
+            ss["video_pool"] = []
+            st.rerun()
+    if ss["video_pool"]:
+        st.caption(f"📋 已加入分析列表 {len(ss['video_pool'])} 个视频："
+                   f"{'、'.join(p['name'] for p in ss['video_pool'])}")
+    elif up:
+        st.caption(f"✅ 已选择 {len(up)} 个视频（点「➕ 添加」加入列表）："
+                   f"{'、'.join(f.name for f in up)}")
     c1, c2, c3 = st.columns([1.0, 1.0, 2.0], gap="small")
     with c1:
         run_btn = st.button("开始分析", use_container_width=True, type="primary")
@@ -2356,27 +2384,34 @@ def run_dashboard() -> None:
             ss["source"] = "模拟演示"
             ss["meta"] = {}
             ss["video_pairs"] = []
+            ss["video_pool"] = []
 
     if run_btn:
-        files = list(up) if up else []
+        # 优先处理已加入列表的视频；列表为空时退回当前上传器选中的视频
+        pool = ss.get("video_pool") or []
+        if pool:
+            files = [(p["name"], p["data"]) for p in pool]
+        elif up:
+            files = [(f.name, f.getvalue()) for f in up]
+        else:
+            files = []
         if files:
             all_records: List[ShotRecord] = []
             pairs: List[Dict[str, object]] = []
             n = len(files)
             bar = st.progress(0.0, text="准备解析视频")
-            for fi, f in enumerate(files):
-                data = f.getvalue()
+            for fi, (fname, data) in enumerate(files):
                 try:
                     recs, meta = VideoShotPipeline().process(
                         data,
-                        progress=lambda p, t: bar.progress((fi + p) / n, text=f"{f.name}：{t}"),
+                        progress=lambda p, t: bar.progress((fi + p) / n, text=f"{fname}：{t}"),
                     )
                     all_records.extend(recs)
                     if meta.get("overlay_path") and os.path.exists(meta["overlay_path"]):
-                        pairs.append({"name": f.name, "orig": data,
+                        pairs.append({"name": fname, "orig": data,
                                       "overlay": meta["overlay_path"]})
                 except Exception as exc:
-                    st.warning(f"「{f.name}」解析失败：{exc}")
+                    st.warning(f"「{fname}」解析失败：{exc}")
             bar.progress(1.0, text="分析完成")
             if all_records:
                 ss["records"] = all_records
