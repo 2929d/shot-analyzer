@@ -1195,7 +1195,7 @@ class DemoDataFactory:
 class BallTracker:
     """基于帧差分的球体检测与质心跟踪（实时性：灰度化 + 固定分辨率缩放）。"""
 
-    def __init__(self, work_width: int = 640):
+    def __init__(self, work_width: int = 480):
         self.work_width = int(work_width)
         self.prev: Optional[np.ndarray] = None
         self.last_shape: Tuple[int, int] = (0, 0)   # 缩放后帧的 (宽, 高)
@@ -1269,6 +1269,19 @@ class BallTracker:
             return best[0], best[1], best[2]
         except Exception:
             return None
+
+    def prime(self, frame) -> None:
+        """廉价地更新上一帧灰度图（供隔帧检测时用，使差分始终只在相邻帧间进行）。
+
+        仅做 resize + 灰度 + 高斯模糊，不做阈值/形态学/轮廓，开销远低于 detect，
+        但能保证在 frame_step>1 时球轨迹差分仍然稳定。
+        """
+        if not CV2_OK:
+            return
+        try:
+            self.prev = self._prep(frame)
+        except Exception:
+            pass
 
 
 class CourtCalibration:
@@ -1417,6 +1430,25 @@ class PoseJointExtractor:
         return hip, shoulder
 
 
+def _store_downscaled(store: Dict[int, "np.ndarray"], keys: List[int],
+                      key: int, frame: "np.ndarray",
+                      cap: int = 200, maxw: int = 320) -> None:
+    """把帧降分辨率后存入 store（按 key 索引），超过 cap 时淘汰最旧的一帧。
+
+    降分辨率存储可把内存从「数百 MB」压到「数十 MB」，避免在云端弱机上
+    因内存压力触发交换而导致整体变慢。
+    """
+    h, w = frame.shape[:2]
+    if w > maxw:
+        s = maxw / float(w)
+        frame = cv2.resize(frame, (maxw, max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+    store[key] = frame
+    keys.append(key)
+    while len(keys) > cap:
+        old = keys.pop(0)
+        store.pop(old, None)
+
+
 class VideoShotPipeline:
     """端到端视频分析：读视频 -> 帧差分跟踪 -> 分段 -> 反演 -> 相位分析 -> 弹道判定。
 
@@ -1453,11 +1485,13 @@ class VideoShotPipeline:
     def process(self, data: bytes,
                 progress: Optional[Callable[[float, str], None]] = None,
                 enable_overlay: bool = True,
-                max_frames: int = 2400
+                max_frames: int = 2400,
+                frame_step: int = 2
                 ) -> Tuple[List[ShotRecord], Dict[str, float]]:
         if not CV2_OK:
             raise RuntimeError(f"OpenCV 导入失败：{CV2_ERR or '未安装 opencv-python-headless'}。无法解析视频。")
 
+        frame_step = max(1, int(frame_step))
         tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_upload.mp4")
         with open(tmp, "wb") as f:
             f.write(data)
@@ -1481,7 +1515,9 @@ class VideoShotPipeline:
         POST_WINDOW = 30   # 丢失球后仍写 30 帧（约 1s），保证动作完整
 
         detections: List[Tuple[int, float, float, float, float]] = []
-        frames_buffer: List[np.ndarray] = []
+        # 降分辨率 + 限量存储，避免数百 MB 内存压力
+        frame_store: Dict[int, np.ndarray] = {}
+        store_keys: List[int] = []
         idx = 0
         t_sum, t_cnt = 0.0, 0
         while True:
@@ -1492,22 +1528,29 @@ class VideoShotPipeline:
                 break
             if fw == 0 or fh == 0:
                 fh, fw = frame.shape[:2]
-            t0 = time.perf_counter()
-            det = self.tracker.detect(frame)
-            cost = (time.perf_counter() - t0) * 1000.0
-            t_sum += cost
-            t_cnt += 1
-            if cost > REALTIME_FRAME_BUDGET_MS and self.tracker.work_width > 320:
-                self.tracker.work_width = max(320, int(self.tracker.work_width * 0.8))
-            if det is not None:
-                u, v, _area = det
-                detections.append((idx, u, v, float(fw), float(fh)))
-                recent.append((u, v))
-                if len(recent) > 40:
-                    recent.pop(0)
-                last_det_idx = idx
-            if len(frames_buffer) < 240:
-                frames_buffer.append(frame)
+            # ---- 隔帧检测：每 frame_step 帧才跑一次完整球跟踪，其余帧仅做廉价 prime ----
+            do_detect = (idx % frame_step == 0)
+            if do_detect:
+                t0 = time.perf_counter()
+                det = self.tracker.detect(frame)
+                cost = (time.perf_counter() - t0) * 1000.0
+                t_sum += cost
+                t_cnt += 1
+                if cost > REALTIME_FRAME_BUDGET_MS and self.tracker.work_width > 320:
+                    self.tracker.work_width = max(320, int(self.tracker.work_width * 0.8))
+                if det is not None:
+                    u, v, _area = det
+                    detections.append((idx, u, v, float(fw), float(fh)))
+                    recent.append((u, v))
+                    if len(recent) > 40:
+                        recent.pop(0)
+                    last_det_idx = idx
+                # 只在检测的帧上存降分辨率帧，供后续出手反演/相位分析使用
+                _store_downscaled(frame_store, store_keys, idx, frame)
+                self.tracker.prime(frame)
+            else:
+                # 非检测帧：廉价更新上一帧灰度，保证差分始终相邻帧进行
+                self.tracker.prime(frame)
 
             # ---- 绘制并写入叠加帧（仅跟踪期间+短暂尾帧，跳过漫长等待片段）----
             if enable_overlay and (recent or idx - last_det_idx <= POST_WINDOW):
@@ -1552,7 +1595,7 @@ class VideoShotPipeline:
         for k, seg in enumerate(segs):
             if progress:
                 progress(0.45 + 0.5 * (k + 1) / n_seg, f"正在反演第 {k + 1} 次出手")
-            rec = self._analyze_segment(seg, fps, frames_buffer)
+            rec = self._analyze_segment(seg, fps, frame_store)
             if rec is not None:
                 rec.idx = len(records) + 1
                 records.append(rec)
@@ -1594,7 +1637,7 @@ class VideoShotPipeline:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
     def _analyze_segment(self, seg: List[Tuple[int, float, float, float, float]],
-                         fps: float, frames_buffer: List[np.ndarray]
+                         fps: float, frame_store: Dict[int, np.ndarray]
                          ) -> Optional[ShotRecord]:
         """对一次出手做完整反演：自标定 -> 联合最小二乘 -> 弹道判定 -> 相位分析。"""
         uv = np.array([[s[1], s[2]] for s in seg], float)
@@ -1616,7 +1659,7 @@ class VideoShotPipeline:
         rp.height, rp.distance = height, distance
 
         # 4) 旋转速度：稠密光流的最小二乘刚体旋转估计
-        spin_rps = self._estimate_spin(frames_buffer, seg, fps)
+        spin_rps = self._estimate_spin(frame_store, seg, fps)
 
         # 5) 完整弹道判定（含阻力与马格努斯升力）
         res = FlightModel.integrate(rp.speed, rp.angle_deg, spin_rps * 2 * math.pi,
@@ -1627,7 +1670,7 @@ class VideoShotPipeline:
         err = clamp(float(abs(res["cross_x"]) * 100.0) if np.isfinite(res["cross_x"]) else 50.0, 0, 120)
 
         # 6) 髋肩关节时序与相位相干性
-        seg_frames = [frames_buffer[s[0]] for s in seg if s[0] < len(frames_buffer)]
+        seg_frames = [frame_store[s[0]] for s in seg if s[0] in frame_store]
         hip, sh = self.pose.extract(seg_frames)
         if hip is None or sh is None:
             hip, sh = self.pose._fallback_signals(
@@ -1664,7 +1707,7 @@ class VideoShotPipeline:
         return (COURT["COURT_WIDTH"] / 2.0,
                 clamp(COURT["RIM_FROM_BASELINE"] + distance, 0.5, COURT["COURT_HALF_LEN"]))
 
-    def _estimate_spin(self, frames_buffer: List[np.ndarray], seg, fps: float) -> float:
+    def _estimate_spin(self, frame_store: Dict[int, np.ndarray], seg, fps: float) -> float:
         """用稠密光流做最小二乘刚体旋转估计，得到旋转速度（转每秒）。
 
         对位移场 u(p) 拟合刚体模型 u = omega x r，最小二乘解为
@@ -1678,10 +1721,10 @@ class VideoShotPipeline:
             ratios = []
             for a, b in zip(seg[:-1], seg[1:]):
                 ia, ib = int(a[0]), int(b[0])
-                if ia >= len(frames_buffer) or ib >= len(frames_buffer):
+                f1 = frame_store.get(ia)
+                f2 = frame_store.get(ib)
+                if f1 is None or f2 is None:
                     continue
-                f1 = frames_buffer[ia]
-                f2 = frames_buffer[ib]
                 s = 240.0 / max(f1.shape[1], 1)
                 f1 = cv2.resize(f1, None, fx=s, fy=s)
                 f2 = cv2.resize(f2, None, fx=s, fy=s)
@@ -2395,6 +2438,13 @@ def run_dashboard() -> None:
         key="enable_overlay",
         help="开启时仅保留「球被跟踪到」的片段生成叠加视频；关闭则只出 9 张图，速度最快。先关闭跑通数据，需要时再开叠加视频。",
     )
+    # 性能模式：隔帧检测，进一步提速（默认为开，大幅缩短弱机等待时间）
+    st.toggle(
+        "性能模式（隔帧检测，更快）",
+        value=ss.get("perf_mode", True),
+        key="perf_mode",
+        help="开启时每 2 帧才做一次球体追踪，分析速度约翻倍；关闭则逐帧检测、精度略高但更慢。默认开启。",
+    )
 
     # ---------------- 数据获取 ----------------
     # 点了「开始分析」时，不要重置为模拟数据，避免浪费计算并保证后续处理真实视频
@@ -2426,6 +2476,7 @@ def run_dashboard() -> None:
                         data,
                         progress=lambda p, t: bar.progress((fi + p) / n, text=f"{fname}：{t}"),
                         enable_overlay=ss.get("enable_overlay", False),
+                        frame_step=3 if ss.get("perf_mode", True) else 1,
                     )
                     all_records.extend(recs)
                     if meta.get("overlay_path") and os.path.exists(meta["overlay_path"]):
