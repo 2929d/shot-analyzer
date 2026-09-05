@@ -1193,7 +1193,10 @@ class DemoDataFactory:
 
 
 class BallTracker:
-    """基于帧差分的球体检测与质心跟踪（实时性：灰度化 + 固定分辨率缩放）。"""
+    """基于 MOG2 背景减除 + HSV 颜色过滤 + 圆形轮廓的球体检测与跟踪。
+
+    相比简单帧差分，MOG2 对固定机位视频更鲁棒；HSV 橙色过滤抑制非篮球移动物体。
+    """
 
     def __init__(self, work_width: int = 480):
         self.work_width = int(work_width)
@@ -1201,6 +1204,15 @@ class BallTracker:
         self.last_shape: Tuple[int, int] = (0, 0)   # 缩放后帧的 (宽, 高)
         self.prev_pos: Optional[Tuple[float, float]] = None   # 上一帧归一化质心
         self.prev_area: float = 0.0                           # 上一帧相对面积
+        self.bg_sub: Optional[Any] = None
+        if CV2_OK:
+            try:
+                # history: 背景模型长度；varThreshold: 越小越敏感
+                self.bg_sub = cv2.createBackgroundSubtractorMOG2(
+                    history=90, varThreshold=22, detectShadows=False
+                )
+            except Exception:
+                self.bg_sub = None
 
     def _prep(self, frame):
         h, w = frame.shape[:2]
@@ -1210,39 +1222,60 @@ class BallTracker:
                                interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.last_shape = (gray.shape[1], gray.shape[0])
-        return cv2.GaussianBlur(gray, (5, 5), 0)
+        return frame, gray, cv2.GaussianBlur(gray, (5, 5), 0)
+
+    def _color_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """HSV 橙色/棕色篮球颜色过滤，抑制人物、地板等非球移动物体。"""
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        # 标准橙色篮球
+        mask1 = cv2.inRange(hsv, np.array([8, 70, 70]), np.array([24, 255, 255]))
+        # 低光/棕色扩展
+        mask2 = cv2.inRange(hsv, np.array([4, 35, 50]), np.array([28, 200, 200]))
+        mask = cv2.bitwise_or(mask1, mask2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
     def detect(self, frame) -> Optional[Tuple[float, float, float]]:
-        """返回归一化质心 (u, v) 与相对面积，取值均在 0~1 之间。
-
-        归一化后与处理分辨率无关，便于运行途中自适应降分辨率而不破坏坐标一致性。
-        """
+        """返回归一化质心 (u, v) 与相对面积，取值均在 0~1 之间。"""
         if not CV2_OK:
             return None
         try:
-            gray = self._prep(frame)
-            if self.prev is None:
-                self.prev = gray
-                return None
-            diff = cv2.absdiff(gray, self.prev)
-            _, mask = cv2.threshold(diff, 22, 255, cv2.THRESH_BINARY)
-            kernel = np.ones((3, 3), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-            self.prev = gray
-            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            bgr, gray, blur = self._prep(frame)
             h, w = gray.shape[:2]
+
+            if self.bg_sub is not None:
+                fg = self.bg_sub.apply(bgr)
+                # MOG2 输出灰度前景，二值化并轻微去噪
+                _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
+                fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+            else:
+                # 无 MOG2 时的降级帧差分
+                if self.prev is None:
+                    self.prev = blur
+                    return None
+                fg = cv2.absdiff(blur, self.prev)
+                _, fg = cv2.threshold(fg, 18, 255, cv2.THRESH_BINARY)
+
+            # 颜色过滤 + 运动前景取交集
+            color = self._color_mask(bgr)
+            combined = cv2.bitwise_and(fg, color)
+            combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+            self.prev = blur
+
+            cnts, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             best, best_score = None, -1e9
             for c in cnts:
                 a_px = cv2.contourArea(c)
                 area = a_px / max(w * h, 1)
-                if a_px < 12 or area > 0.08:
+                # 允许更小的球（画面中球可能很小）
+                if a_px < 8 or area > 0.12:
                     continue
                 peri = cv2.arcLength(c, True)
                 if peri < 1e-3:
                     continue
-                circ = 4.0 * math.pi * a_px / (peri * peri)   # 圆度：1 为完美圆
-                if circ < 0.42:                               # 非圆形团块直接排除
+                circ = 4.0 * math.pi * a_px / (peri * peri)
+                # 放宽圆度要求，真实篮球在运动中可能略扁
+                if circ < 0.32:
                     continue
                 M = cv2.moments(c)
                 if M["m00"] < 1e-6:
@@ -1251,12 +1284,10 @@ class BallTracker:
                 v = float(M["m01"] / M["m00"]) / max(h, 1)
                 score = 2.0 * circ
                 if self.prev_pos is not None:
-                    # 运动连续性：离上一帧越近越可信；跳变过大判为噪声
                     d = math.hypot(u - self.prev_pos[0], v - self.prev_pos[1])
-                    score += 1.6 * math.exp(-((d / 0.10) ** 2))
-                    if d > 0.32:
+                    score += 1.6 * math.exp(-((d / 0.12) ** 2))
+                    if d > 0.38:
                         score -= 2.0
-                    # 面积连续性（球体在画面中大小变化平缓）
                     if self.prev_area > 0:
                         ratio = (area + 1e-6) / (self.prev_area + 1e-6)
                         score -= 0.6 * abs(math.log(max(ratio, 1e-6)))
@@ -1271,15 +1302,14 @@ class BallTracker:
             return None
 
     def prime(self, frame) -> None:
-        """廉价地更新上一帧灰度图（供隔帧检测时用，使差分始终只在相邻帧间进行）。
-
-        仅做 resize + 灰度 + 高斯模糊，不做阈值/形态学/轮廓，开销远低于 detect，
-        但能保证在 frame_step>1 时球轨迹差分仍然稳定。
-        """
+        """隔帧检测时仍更新背景模型与上一帧灰度，保持差分稳定性。"""
         if not CV2_OK:
             return
         try:
-            self.prev = self._prep(frame)
+            bgr, gray, blur = self._prep(frame)
+            if self.bg_sub is not None:
+                self.bg_sub.apply(bgr)
+            self.prev = blur
         except Exception:
             pass
 
@@ -2247,7 +2277,7 @@ def fig_pareto(ds: ShotDataset) -> "go.Figure":
 
 # 每张图下方的一行原理说明（通俗文字，不含任何数学符号）
 FIGURE_CAPTIONS = [
-    "图1 命中率热力图：颜色越亮，表示该出手点命中率越高，可找到你最稳的投篮位置。",
+    "图1 命中率热力图：颜色越亮表示该出手点命中率越高。未上传 calibration.json 时，米数为默认比例估算，仅作相对参考。",
     "图2 累计命中率曲线：出手越多曲线越平稳，能反映你的真实长期命中水平。",
     "图3 指标相关性矩阵：颜色越深，代表两项指标关联越强，例如弧度与命中往往正相关。",
     "图4 稳定性得分：分数越高，说明每次出手的速度与角度越接近你的个人基准动作。",
@@ -2313,6 +2343,12 @@ CSS_TEMPLATE = """
   .stButton > button:hover {{ background: #1D4ED8; color: #FFFFFF; }}
   .stFileUploader > div {{ border: 1px dashed {border} !important; background: transparent; }}
   div[data-baseweb="select"] > div {{ background: {bg} !important; }}
+  .demo-banner {{
+      background: #7C2D12; color: #FFFBEB; border: 1px solid #F59E0B;
+      border-radius: 2px; padding: 10px 14px; margin: 8px 0 12px 0;
+      font-size: 13px; line-height: 1.6;
+  }}
+  .demo-banner b {{ color: #FCD34D; }}
 </style>
 """
 
@@ -2447,14 +2483,13 @@ def run_dashboard() -> None:
     )
 
     # ---------------- 数据获取 ----------------
-    # 点了「开始分析」时，不要重置为模拟数据，避免浪费计算并保证后续处理真实视频
-    if demo_toggle and not run_btn and (ss["records"] is None or ss["source"] == "模拟演示"):
+    # 仅当用户明确打开「模拟数据演示」且没有点「开始分析」时才生成演示数据
+    if demo_toggle and not run_btn:
         with st.spinner("正在生成模拟投篮数据"):
             ss["records"] = DemoDataFactory().generate(60)
             ss["source"] = "模拟演示"
             ss["meta"] = {}
             ss["video_pairs"] = []
-            ss["video_pool"] = []
 
     if run_btn:
         # 优先处理已加入列表的视频；列表为空时退回当前上传器选中的视频
@@ -2468,6 +2503,7 @@ def run_dashboard() -> None:
         if files:
             all_records: List[ShotRecord] = []
             pairs: List[Dict[str, object]] = []
+            errors: List[str] = []
             n = len(files)
             bar = st.progress(0.0, text="准备解析视频")
             for fi, (fname, data) in enumerate(files):
@@ -2483,6 +2519,7 @@ def run_dashboard() -> None:
                         pairs.append({"name": fname, "orig": data,
                                       "overlay": meta["overlay_path"]})
                 except Exception as exc:
+                    errors.append(f"{fname}：{exc}")
                     st.warning(f"「{fname}」解析失败：{exc}")
             bar.progress(1.0, text="分析完成")
             if all_records:
@@ -2491,23 +2528,53 @@ def run_dashboard() -> None:
                 ss["meta"] = {"frames": int(meta.get("frames", 0))}
                 ss["video_pairs"] = pairs
             else:
-                ss["records"] = DemoDataFactory().generate(60)
-                ss["source"] = "视频解析失败，已降级为模拟演示"
+                # 不再静默 fallback 到假数据，避免误导用户
+                ss["records"] = []
+                ss["source"] = "视频解析失败"
                 ss["video_pairs"] = []
-                st.warning("所有视频均解析失败，已自动切换为模拟数据。")
+                st.error("未能从任何视频中提取到有效出手。常见原因与排查：")
+                st.markdown(
+                    """
+                    1. **篮球没被稳定追踪到**：请使用侧视/固定机位，保证篮球在画面中清晰可见，避免人遮挡球太久。
+                    2. **光线或对比度不足**：球与背景颜色相近时建议换亮色球或改善照明。
+                    3. **视频分辨率/帧率过低**：建议至少 720p、30fps。
+                    4. **拍摄距离太远**：球在画面中像素过少（<8 像素）时无法识别。
+                    """
+                )
+                if errors:
+                    with st.expander("查看详细错误"):
+                        for e in errors:
+                            st.code(e)
         else:
-            ss["records"] = DemoDataFactory().generate(60)
-            ss["source"] = "模拟演示"
-            ss["video_pairs"] = []
-            st.info("未检测到视频文件，已使用模拟数据演示")
+            st.warning("请先添加视频到列表，或打开「模拟数据演示」查看示例。")
 
-    if ss["records"] is None:
-        ss["records"] = DemoDataFactory().generate(60)
-        ss["source"] = "模拟演示"
+    # 没有任何数据时显示提示，不再自动填充假数据
+    if not ss.get("records"):
+        st.info("暂无数据。上传真实视频并点「开始分析」，或打开「模拟数据演示」查看示例图表。")
+        return
 
     # ---------------- 数据与图表 ----------------
     ds = ShotDataset(ss["records"])
     _render_nav(ds.n, int(ds.made.sum()), float(ds.made.mean()) if ds.n else 0.0)
+
+    if ss.get("source") == "模拟演示":
+        st.markdown(
+            '<div class="demo-banner">'
+            '<b>⚠️ 当前为模拟演示数据</b>：下方图表中的出手次数、位置、命中率均为算法随机生成的示例，'
+            '并非来自你上传的视频。请关闭本开关后重新点击「开始分析」以查看真实结果。'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    elif ss.get("source", "").startswith("视频："):
+        # 只有视频源才显示位置估算提示；模拟数据本身已是示意，不再重复
+        if not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")):
+            st.markdown(
+                '<div class="sect">'
+                '位置提示：未检测到 calibration.json，热力图与距离按默认像素比例估算，'
+                '如需绝对米数，请在仓库根目录上传包含 image_points / court_points 的校准文件。'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
     figs = build_all_figures(ds)
     for row in range(3):
