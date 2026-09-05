@@ -24,6 +24,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -1465,8 +1466,16 @@ class VideoShotPipeline:
             fps = 30.0
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         total = total if total > 0 else 600
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
-        detections: List[Tuple[int, float, float]] = []
+        # ---- 叠加视频写入器：把球的轨迹 + 发力链画回画面 ----
+        overlay_path = os.path.join(tempfile.gettempdir(), f"shot_overlay_{uuid.uuid4().hex}.mp4")
+        vw = None
+        ow = oh = 0
+        recent: List[Tuple[float, float]] = []   # 归一化球心轨迹（最近 40 个）
+
+        detections: List[Tuple[int, float, float, float, float]] = []
         frames_buffer: List[np.ndarray] = []
         idx = 0
         t_sum, t_cnt = 0.0, 0
@@ -1474,6 +1483,8 @@ class VideoShotPipeline:
             ok, frame = cap.read()
             if not ok:
                 break
+            if fw == 0 or fh == 0:
+                fh, fw = frame.shape[:2]
             t0 = time.perf_counter()
             det = self.tracker.detect(frame)
             cost = (time.perf_counter() - t0) * 1000.0
@@ -1482,14 +1493,34 @@ class VideoShotPipeline:
             if cost > REALTIME_FRAME_BUDGET_MS and self.tracker.work_width > 320:
                 self.tracker.work_width = max(320, int(self.tracker.work_width * 0.8))
             if det is not None:
-                w, h = self.tracker.last_shape
-                detections.append((idx, det[0], det[1], float(w), float(h)))
+                u, v, _area = det
+                detections.append((idx, u, v, float(fw), float(fh)))
+                recent.append((u, v))
+                if len(recent) > 40:
+                    recent.pop(0)
             if len(frames_buffer) < 240:
                 frames_buffer.append(frame)
+
+            # ---- 绘制并写入叠加帧 ----
+            if ow == 0 and fw and fh:
+                ow = min(fw, 720)
+                oh = int(fh * ow / float(fw))
+                try:
+                    vw = cv2.VideoWriter(overlay_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                         float(fps), (ow, oh))
+                except Exception:
+                    vw = None
+            if vw is not None:
+                out = cv2.resize(frame, (ow, oh))
+                self._draw_overlay(out, recent, float(idx) / max(total, 1))
+                vw.write(out)
+
             idx += 1
             if progress and idx % 10 == 0:
                 progress(min(0.45, idx / max(total, 1) * 0.9), "正在追踪球体")
         cap.release()
+        if vw is not None:
+            vw.release()
         try:
             os.remove(tmp)
         except Exception:
@@ -1497,6 +1528,12 @@ class VideoShotPipeline:
 
         self.frame_ms = safe_div(t_sum, t_cnt, 0.0)
         if len(detections) < self.MIN_SEGMENT:
+            # 哪怕没有稳定追踪到球，也保留叠加视频供肉眼参考
+            if os.path.exists(overlay_path) and os.path.getsize(overlay_path) == 0:
+                try:
+                    os.remove(overlay_path)
+                except Exception:
+                    pass
             raise RuntimeError("未在视频中稳定追踪到球体")
 
         segs = self._segment(detections)
@@ -1510,9 +1547,41 @@ class VideoShotPipeline:
                 rec.idx = len(records) + 1
                 records.append(rec)
         if not records:
+            if os.path.exists(overlay_path):
+                try:
+                    os.remove(overlay_path)
+                except Exception:
+                    pass
             raise RuntimeError("未从视频中提取到有效出手")
-        return records, dict(fps=float(fps), frame_ms=float(self.frame_ms),
-                             frames=int(idx), segments=len(segs))
+
+        meta = dict(fps=float(fps), frame_ms=float(self.frame_ms),
+                    frames=int(idx), segments=len(segs))
+        if os.path.exists(overlay_path) and os.path.getsize(overlay_path) > 0:
+            meta["overlay_path"] = overlay_path
+        return records, meta
+
+    @staticmethod
+    def _draw_overlay(out: "np.ndarray", recent: List[Tuple[float, float]], progress_frac: float) -> None:
+        """在单帧上叠加：青色轨迹、绿色球心、黄色发力链、进度文字。"""
+        h, w = out.shape[:2]
+        # 1) 轨迹：青色连线
+        if len(recent) >= 2:
+            pts = [(int(u * w), int(v * h)) for u, v in recent]
+            for i in range(1, len(pts)):
+                cv2.line(out, pts[i - 1], pts[i], (255, 235, 0), 2, cv2.LINE_AA)
+        # 2) 当前球：绿色圆点 + 方框
+        if recent:
+            bx, by = int(recent[-1][0] * w), int(recent[-1][1] * h)
+            cv2.circle(out, (bx, by), 7, (60, 200, 60), -1)
+            cv2.rectangle(out, (bx - 16, by - 16), (bx + 16, by + 16), (60, 200, 60), 1, cv2.LINE_AA)
+            # 3) 发力链：从核心（画面底部中央）到球的黄色线
+            core = (w // 2, int(h * 0.95))
+            cv2.line(out, core, (bx, by), (0, 215, 255), 3, cv2.LINE_AA)
+            cv2.putText(out, "发力链", (core[0] + 10, core[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 215, 255), 1, cv2.LINE_AA)
+        # 4) 进度文字
+        cv2.putText(out, f"追踪进度 {progress_frac * 100:.0f}%", (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
     def _analyze_segment(self, seg: List[Tuple[int, float, float, float, float]],
                          fps: float, frames_buffer: List[np.ndarray]
@@ -1739,6 +1808,86 @@ def build_feedback(ds: ShotDataset) -> List[str]:
     if not msgs:
         msgs.append("整体表现平稳，可尝试增加出手量")
     return msgs[:3]
+
+
+def build_improvement_guide(ds: ShotDataset) -> List[Tuple[str, str]]:
+    """把生物力学指标翻译成可执行的训练建议，回答"怎么提高命中率"。
+
+    返回 [(要点, 说明), ...]，要点用于卡片标题，说明给出具体做法。
+    """
+    out: List[Tuple[str, str]] = []
+    if ds.n == 0:
+        return [("暂无数据", "上传投篮视频或开启模拟演示后，这里会给出针对性训练建议")]
+    ang = float(np.mean(ds.angle))
+    spd = float(np.mean(ds.speed))
+    spd_std = float(np.std(ds.speed)) if ds.n >= 3 else 0.0
+    entry = float(np.mean(ds.entry))
+    plv = float(np.mean(ds.plv))
+    err = float(np.mean(ds.error))
+    spin = float(np.mean(ds.spin))
+    rate = float(ds.made.mean()) * 100.0
+
+    # 1) 出手弧度
+    if ang < 45.0:
+        out.append(("抬高出手弧度",
+                    f"当前平均 {ang:.1f} 度，低于 48 度理想区间。弧度越高，球入筐的容错窗口越大，"
+                    "建议抬肘到 48~52 度，让球更接近垂直下落。"))
+    elif ang > 54.0:
+        out.append(("压低出手弧度",
+                    f"当前平均 {ang:.1f} 度，偏高。弧度过大虽然容错高但更难控制、更费力气，"
+                    "建议回到 48~52 度，减少能量浪费。"))
+    else:
+        out.append(("弧度保持良好",
+                    f"当前平均 {ang:.1f} 度，落在 48~52 度理想区间，继续维持这个出手角度。"))
+
+    # 2) 速度稳定
+    if spd_std > 0.22:
+        out.append(("固定出手速度",
+                    f"速度波动 {spd_std:.2f} 米每秒偏大，是命中漂移的主因。建议用节拍器固定蹬伸发力节奏，"
+                    "把波动压到 0.15 米每秒以内。"))
+    else:
+        out.append(("速度控制稳定",
+                    f"速度波动仅 {spd_std:.2f} 米每秒，发力一致性很好，保持当前节奏即可。"))
+
+    # 3) 入筐角度
+    if entry < 40.0:
+        out.append(("改善入筐角度",
+                    f"平均入筐角 {entry:.1f} 度偏平，球从侧面进筐的窗口很小。抬高弧顶、增大下落角度，"
+                    "可显著扩大命中容错。"))
+    else:
+        out.append(("入筐角度理想",
+                    f"平均入筐角 {entry:.1f} 度，接近垂直下落，进筐容错窗口较大。"))
+
+    # 4) 髋肩发力顺序
+    if plv < 0.62:
+        out.append(("理顺发力顺序",
+                    f"髋肩相位锁定值 {plv:.2f} 偏低，说明蹬地（髋）与抬臂（肩）不同步。先练"
+                    "「屈膝-蹬伸-抬肘-跟随」的顺序发力，让下肢带动上肢。"))
+    else:
+        out.append(("发力链条顺畅",
+                    f"髋肩相位锁定值 {plv:.2f} 较高，上下肢联动协调，这是稳定命中的核心能力。"))
+
+    # 5) 落点偏差
+    if err > 26.0:
+        out.append(("缩小落点偏差",
+                    f"平均落点偏差 {err:.0f} 厘米偏大。先在中距离（约 4~5 米）把动作定型，"
+                    "再逐步拉到三分线，避免远距离放大误差。"))
+    else:
+        out.append(("落点足够集中",
+                    f"平均落点偏差仅 {err:.0f} 厘米，出手指向性很好，可尝试加大难度挑战。"))
+
+    # 6) 后旋
+    if spin < 1.8:
+        out.append(("增加后旋",
+                    f"平均后旋 {spin:.1f} 转每秒偏少。适当增加后旋（约 2.5 转每秒）能让球碰筐后更易"
+                    "「吸」入，减少弹飞。"))
+    else:
+        out.append(("后旋充足",
+                    f"平均后旋 {spin:.1f} 转每秒，球的「吸筐」效果较好，碰筐后更易落入。"))
+    # 7) 总评
+    out.append(("整体命中率",
+                f"当前命中率 {rate:.1f}%。每次训练聚焦 1~2 个指标改进，比同时改所有动作更有效。"))
+    return out
 
 
 # ==============================================================================
@@ -2045,15 +2194,15 @@ def fig_pareto(ds: ShotDataset) -> "go.Figure":
 
 # 每张图下方的一行原理说明（通俗文字，不含任何数学符号）
 FIGURE_CAPTIONS = [
-    "离筐越近，命中机会越大",
-    "投得越多，曲线越平稳",
-    "颜色越深，两项关联越紧",
-    "得分越高，动作越稳定",
-    "弧度合适，命中才会更高",
-    "发力顺序顺畅更省力气",
-    "落点集中，说明手感稳定",
-    "分组观察状态起伏变化",
-    "星号处为最优参数组合",
+    "图1 命中率热力图：颜色越亮，表示该出手点命中率越高，可找到你最稳的投篮位置。",
+    "图2 累计命中率曲线：出手越多曲线越平稳，能反映你的真实长期命中水平。",
+    "图3 指标相关性矩阵：颜色越深，代表两项指标关联越强，例如弧度与命中往往正相关。",
+    "图4 稳定性得分：分数越高，说明每次出手的速度与角度越接近你的个人基准动作。",
+    "图5 出手角度分布：金色为命中出手，可见命中多集中在 48~52 度的理想弧度区间。",
+    "图6 髋肩发力时间曲线：髋（蹬地）应先于肩（抬臂）启动，顺序顺畅更省力也更稳。",
+    "图7 落点偏差与弧顶高度：弧顶越高、下落越垂直，前后落点偏差通常越小。",
+    "图8 分组命中率：每 5 投一组观察手感起伏，连续绿色段代表连续命中状态。",
+    "图9 参数命中概率：星号处为模型预测的最优角度-速度组合，可作为你的练习目标。",
 ]
 
 
@@ -2083,6 +2232,14 @@ CSS_TEMPLATE = """
   .nav .stats b {{ color: #FFFFFF; font-weight: 600; }}
   .sect {{ color: {muted}; font-size: 12px; margin: 2px 0 8px 0; }}
   .cap {{ color: {muted}; font-size: 12px; padding: 0 2px 8px 2px; line-height: 1.5; }}
+  .guide-card {{
+      background: {logbg}; border: 1px solid {border}; border-radius: 2px;
+      padding: 10px 14px; margin-bottom: 8px;
+  }}
+  .guide-title {{ color: {accent}; font-size: 14px; font-weight: 600; margin-bottom: 4px; }}
+  .guide-text {{ color: {text}; font-size: 13px; line-height: 1.6; }}
+  .vlabel {{ color: {muted}; font-size: 12px; text-align: center; margin-top: 4px; }}
+  .vwrap {{ border: 1px solid {border}; border-radius: 2px; padding: 8px; }}
   .logbox {{
       height: 80px; overflow-y: auto; background: {logbg};
       border: 1px solid {border}; border-radius: 2px; padding: 8px 12px;
@@ -2164,17 +2321,20 @@ def run_dashboard() -> None:
     ss.setdefault("records", None)
     ss.setdefault("source", "未加载")
     ss.setdefault("meta", {})
+    ss.setdefault("video_pairs", [])
 
     # ---------------- 顶部交互区 ----------------
-    # 上传器单独一行，避免大文件上传后把按钮挤到屏幕外
-    up = st.file_uploader("上传投篮视频（支持 MP4 / MOV / AVI）",
+    # 上传器单独一行，避免大文件上传后把按钮挤到屏幕外；支持多视频
+    up = st.file_uploader("上传投篮视频（可多选，支持 MP4 / MOV / AVI）",
                           type=["mp4", "mov", "avi", "m4v"],
+                          accept_multiple_files=True,
                           label_visibility="visible")
     c1, c2, c3 = st.columns([1.0, 1.0, 2.0], gap="small")
     with c1:
         run_btn = st.button("开始分析", use_container_width=True, type="primary")
     with c2:
-        demo_toggle = st.toggle("模拟数据演示", value=(ss["records"] is None))
+        demo_toggle = st.toggle("模拟数据演示",
+                                value=(ss["records"] is None and not ss["video_pairs"]))
     with c3:
         meta_txt = ""
         frame_ms = float(ss["meta"].get("frame_ms", 0.0) or 0.0)
@@ -2189,27 +2349,43 @@ def run_dashboard() -> None:
             ss["records"] = DemoDataFactory().generate(60)
             ss["source"] = "模拟演示"
             ss["meta"] = {}
+            ss["video_pairs"] = []
 
     if run_btn:
-        if up is not None:
+        files = list(up) if up else []
+        if files:
+            all_records: List[ShotRecord] = []
+            pairs: List[Dict[str, object]] = []
+            n = len(files)
             bar = st.progress(0.0, text="准备解析视频")
-            try:
-                records, meta = VideoShotPipeline().process(
-                    up.getvalue(),
-                    progress=lambda p, t: bar.progress(min(1.0, p), text=t),
-                )
-                ss["records"], ss["source"], ss["meta"] = records, f"视频：{up.name}", meta
-                bar.progress(1.0, text="分析完成")
-            except Exception as exc:  # 视频读取或解析失败 -> 降级到模拟数据
+            for fi, f in enumerate(files):
+                data = f.getvalue()
+                try:
+                    recs, meta = VideoShotPipeline().process(
+                        data,
+                        progress=lambda p, t: bar.progress((fi + p) / n, text=f"{f.name}：{t}"),
+                    )
+                    all_records.extend(recs)
+                    if meta.get("overlay_path") and os.path.exists(meta["overlay_path"]):
+                        pairs.append({"name": f.name, "orig": data,
+                                      "overlay": meta["overlay_path"]})
+                except Exception as exc:
+                    st.warning(f"「{f.name}」解析失败：{exc}")
+            bar.progress(1.0, text="分析完成")
+            if all_records:
+                ss["records"] = all_records
+                ss["source"] = f"视频：{n} 个文件，共 {len(all_records)} 次出手"
+                ss["meta"] = {"frames": int(meta.get("frames", 0))}
+                ss["video_pairs"] = pairs
+            else:
                 ss["records"] = DemoDataFactory().generate(60)
-                ss["source"] = f"视频解析失败，已降级为模拟演示（{exc}）"
-                ss["meta"] = {}
-                bar.empty()
-                st.warning(f"视频解析失败，已自动切换为模拟数据：{exc}")
+                ss["source"] = "视频解析失败，已降级为模拟演示"
+                ss["video_pairs"] = []
+                st.warning("所有视频均解析失败，已自动切换为模拟数据。")
         else:
             ss["records"] = DemoDataFactory().generate(60)
             ss["source"] = "模拟演示"
-            ss["meta"] = {}
+            ss["video_pairs"] = []
             st.info("未检测到视频文件，已使用模拟数据演示")
 
     if ss["records"] is None:
@@ -2229,6 +2405,34 @@ def run_dashboard() -> None:
                 with st.container(border=True):
                     _chart(figs[i], key=f"fig_{i}")
                     st.markdown(f'<div class="cap">{FIGURE_CAPTIONS[i]}</div>', unsafe_allow_html=True)
+
+    # ---------------- 发力链叠加视频（原始 与 叠加 并排） ----------------
+    if ss["video_pairs"]:
+        st.markdown('<div class="sect">发力链叠加视频（原始画面 与 生物力学叠加 并排对比）</div>',
+                    unsafe_allow_html=True)
+        st.caption("云端未启用 MediaPipe，骨骼采用「发力链 + 球轨迹」近似叠加：黄色线为从核心到球的发力传递，"
+                   "青色线为球的运动轨迹，绿点为实时球心。")
+        for p in ss["video_pairs"]:
+            co, cv = st.columns(2, gap="small")
+            with co:
+                st.markdown('<div class="vwrap">', unsafe_allow_html=True)
+                st.video(p["orig"])
+                st.markdown('</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="vlabel">原始画面：{p["name"]}</div>', unsafe_allow_html=True)
+            with cv:
+                st.markdown('<div class="vwrap">', unsafe_allow_html=True)
+                if os.path.exists(str(p["overlay"])):
+                    with open(str(p["overlay"]), "rb") as fh:
+                        st.video(fh.read())
+                st.markdown('</div>', unsafe_allow_html=True)
+                st.markdown('<div class="vlabel">发力链叠加</div>', unsafe_allow_html=True)
+
+    # ---------------- 怎么提高命中率 ----------------
+    st.markdown('<div class="sect">怎么提高命中率（基于你的数据给出针对性建议）</div>',
+                unsafe_allow_html=True)
+    for title, text in build_improvement_guide(ds):
+        st.markdown(f'<div class="guide-card"><div class="guide-title">{title}</div>'
+                    f'<div class="guide-text">{text}</div></div>', unsafe_allow_html=True)
 
     # ---------------- 底部日志 ----------------
     st.markdown('<div class="sect">算法反馈</div>', unsafe_allow_html=True)
