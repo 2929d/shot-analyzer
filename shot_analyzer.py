@@ -2388,13 +2388,13 @@ def run_dashboard() -> None:
                     unsafe_allow_html=True)
 
     # 叠加视频开关：关闭后不再编码叠加视频，分析速度显著加快
-    enable_overlay = st.toggle(
+    # 用 key 让 Streamlit 自己管理 session_state，不要手动再赋值给同一个 key
+    st.toggle(
         "生成发力链叠加视频（开启会慢一些）",
         value=ss.get("enable_overlay", False),
         key="enable_overlay",
         help="开启时仅保留「球被跟踪到」的片段生成叠加视频；关闭则只出 9 张图，速度最快。先关闭跑通数据，需要时再开叠加视频。",
     )
-    ss["enable_overlay"] = enable_overlay
 
     # ---------------- 数据获取 ----------------
     # 点了「开始分析」时，不要重置为模拟数据，避免浪费计算并保证后续处理真实视频
@@ -2425,7 +2425,7 @@ def run_dashboard() -> None:
                     recs, meta = VideoShotPipeline().process(
                         data,
                         progress=lambda p, t: bar.progress((fi + p) / n, text=f"{fname}：{t}"),
-                        enable_overlay=enable_overlay,
+                        enable_overlay=ss.get("enable_overlay", False),
                     )
                     all_records.extend(recs)
                     if meta.get("overlay_path") and os.path.exists(meta["overlay_path"]):
