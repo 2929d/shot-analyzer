@@ -2325,10 +2325,16 @@ def run_dashboard() -> None:
 
     # ---------------- 顶部交互区 ----------------
     # 上传器单独一行，避免大文件上传后把按钮挤到屏幕外；支持多视频
-    up = st.file_uploader("上传投篮视频（可多选，支持 MP4 / MOV / AVI）",
-                          type=["mp4", "mov", "avi", "m4v"],
-                          accept_multiple_files=True,
-                          label_visibility="visible")
+    up = st.file_uploader(
+        "上传投篮视频（可多选，支持 MP4 / MOV / AVI）",
+        type=["mp4", "mov", "avi", "m4v"],
+        accept_multiple_files=True,
+        label_visibility="visible",
+        help="在弹出的文件选择框里【一次选中多个视频】：按住 Ctrl / Cmd 点选多个，"
+             "或框选 / 拖拽。注意：重新打开对话框会替换已选列表，请一次性选齐再点「开始分析」。",
+    )
+    if up:
+        st.caption(f"✅ 已选择 {len(up)} 个视频：{'、'.join(f.name for f in up)}")
     c1, c2, c3 = st.columns([1.0, 1.0, 2.0], gap="small")
     with c1:
         run_btn = st.button("开始分析", use_container_width=True, type="primary")
