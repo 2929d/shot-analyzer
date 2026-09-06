@@ -139,6 +139,17 @@ def safe_div(a: float, b: float, default: float = 0.0) -> float:
     return float(a) / float(b) if abs(float(b)) > 1e-12 else float(default)
 
 
+def _human_size(num_bytes: int) -> str:
+    """把字节数转成易读字符串。"""
+    units = ["B", "KB", "MB", "GB"]
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024.0:
+            return f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.2f}GB"
+
+
 def moving_average(x: Sequence[float], window: int) -> np.ndarray:
     x = np.asarray(x, dtype=float)
     if x.size == 0:
@@ -2349,6 +2360,12 @@ CSS_TEMPLATE = """
       font-size: 13px; line-height: 1.6;
   }}
   .demo-banner b {{ color: #FCD34D; }}
+  .size-warning {{
+      background: #451A03; color: #FEF3C7; border: 1px solid #D97706;
+      border-radius: 2px; padding: 10px 14px; margin: 8px 0 12px 0;
+      font-size: 13px; line-height: 1.6;
+  }}
+  .size-warning b {{ color: #FCD34D; }}
 </style>
 """
 
@@ -2422,7 +2439,7 @@ def run_dashboard() -> None:
         accept_multiple_files=True,
         key=f"upl_{ss['uploader_key_idx']}",
         label_visibility="visible",
-        help="选中视频后点下方的「➕ 添加」，可反复添加多个视频；也可在对话框里一次选多个。",
+        help="上传速度主要由你的网络上行带宽决定；建议单个视频不超过 30MB，总大小不超过 80MB。选中视频后点「➕ 添加」。",
     )
     add_col, clear_col = st.columns([1.0, 1.0], gap="small")
     with add_col:
@@ -2447,11 +2464,19 @@ def run_dashboard() -> None:
             ss["video_pool"] = []
             st.rerun()
     if ss["video_pool"]:
-        st.caption(f"📋 已加入分析列表 {len(ss['video_pool'])} 个视频："
-                   f"{'、'.join(p['name'] for p in ss['video_pool'])}")
+        total_mb = sum(len(p["data"]) for p in ss["video_pool"]) / (1024 * 1024)
+        size_items = ", ".join(f"{p['name']} ({_human_size(len(p['data']))})" for p in ss["video_pool"])
+        st.caption(f"📋 已加入分析列表 {len(ss['video_pool'])} 个视频（共 {total_mb:.1f} MB）：{size_items}")
+        if total_mb > 80:
+            st.markdown(
+                '<div class="size-warning"><b>⚠️ 上传总量偏大</b>：'
+                f'当前 {total_mb:.1f} MB，上传耗时主要取决于你的网络上行带宽。'
+                '建议先用手机「压缩/导出低分辨率」或剪辑到只保留投篮片段，能显著加快上传。</div>',
+                unsafe_allow_html=True,
+            )
     elif up:
-        st.caption(f"✅ 已选择 {len(up)} 个视频（点「➕ 添加」加入列表）："
-                   f"{'、'.join(f.name for f in up)}")
+        tmp_total = sum(len(f.getvalue()) for f in up) / (1024 * 1024)
+        st.caption(f"✅ 已选择 {len(up)} 个视频（共 {tmp_total:.1f} MB，点「➕ 添加」加入列表）")
     c1, c2, c3 = st.columns([1.0, 1.0, 2.0], gap="small")
     with c1:
         run_btn = st.button("开始分析", use_container_width=True, type="primary")
@@ -2466,20 +2491,32 @@ def run_dashboard() -> None:
         st.markdown(f'<div class="sect">数据来源：{ss["source"]}{meta_txt}</div>',
                     unsafe_allow_html=True)
 
+    st.info(
+        "💡 上传慢通常是因为视频文件太大（网络上行带宽是瓶颈）。"
+        "建议：① 用手机剪映/iMovie 剪掉非投篮片段；② 导出时选 720p；③ 一次只分析 1–2 个短视频。"
+    )
+
     # 叠加视频开关：关闭后不再编码叠加视频，分析速度显著加快
     # 用 key 让 Streamlit 自己管理 session_state，不要手动再赋值给同一个 key
     st.toggle(
         "生成发力链叠加视频（开启会慢一些）",
         value=ss.get("enable_overlay", False),
         key="enable_overlay",
-        help="开启时仅保留「球被跟踪到」的片段生成叠加视频；关闭则只出 9 张图，速度最快。先关闭跑通数据，需要时再开叠加视频。",
+        help="开启时仅保留「球被跟踪到」的片段生成叠加视频；关闭则只出 9 张图，速度最快。想先跑通数据就保持关闭。",
     )
     # 性能模式：隔帧检测，进一步提速（默认为开，大幅缩短弱机等待时间）
     st.toggle(
         "性能模式（隔帧检测，更快）",
         value=ss.get("perf_mode", True),
         key="perf_mode",
-        help="开启时每 2 帧才做一次球体追踪，分析速度约翻倍；关闭则逐帧检测、精度略高但更慢。默认开启。",
+        help="开启时每 3 帧做一次球体追踪，分析速度约翻倍；关闭则逐帧检测、精度略高但更慢。默认开启。",
+    )
+    # 极速模式：进一步降低处理分辨率，适合大文件或弱网环境
+    st.toggle(
+        "极速分析（进一步压缩处理分辨率）",
+        value=ss.get("ultra_mode", False),
+        key="ultra_mode",
+        help="开启时把视频分析分辨率降到 320px 并加大隔帧间隔，处理最快，但精度会略有下降。上传慢时可优先打开。",
     )
 
     # ---------------- 数据获取 ----------------
@@ -2508,11 +2545,17 @@ def run_dashboard() -> None:
             bar = st.progress(0.0, text="准备解析视频")
             for fi, (fname, data) in enumerate(files):
                 try:
-                    recs, meta = VideoShotPipeline().process(
+                    pipeline = VideoShotPipeline()
+                    if ss.get("ultra_mode", False):
+                        pipeline.tracker.work_width = 320
+                        frame_step = 5
+                    else:
+                        frame_step = 3 if ss.get("perf_mode", True) else 1
+                    recs, meta = pipeline.process(
                         data,
                         progress=lambda p, t: bar.progress((fi + p) / n, text=f"{fname}：{t}"),
                         enable_overlay=ss.get("enable_overlay", False),
-                        frame_step=3 if ss.get("perf_mode", True) else 1,
+                        frame_step=frame_step,
                     )
                     all_records.extend(recs)
                     if meta.get("overlay_path") and os.path.exists(meta["overlay_path"]):
