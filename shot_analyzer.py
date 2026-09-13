@@ -1213,7 +1213,7 @@ def _get_demo_records(n: int = 36) -> List[ShotRecord]:
     if _cached_demo_fn is None:
         if _under_streamlit():
             try:
-                _cached_demo_fn = st.cache_data(ttl=3600)(_demo_records)
+                _cached_demo_fn = st.cache_data(ttl=3600, show_spinner=False)(_demo_records)
             except Exception:
                 # 缓存初始化失败（环境差异）时降级为直接生成，保证演示开关始终可用
                 _cached_demo_fn = _demo_records
@@ -2715,14 +2715,21 @@ def run_dashboard() -> None:
 
     # 系统按置信度自动保留最像真实投篮的前 N 段；用户只需改一个数字即可校正出手次数
     n_auto = len(recs)
+    st.divider()
+    st.markdown(
+        '<div style="font-size:16px;font-weight:600;color:#60A5FA;margin:8px 0 4px 0;">'
+        "✏️ 校正出手次数"
+        '</div>',
+        unsafe_allow_html=True,
+    )
     actual = st.number_input(
-        "实际出手次数（若系统识别偏多/偏少，请改为真实次数；自动保留置信度最高的出手）",
+        "实际出手次数（若系统识别偏多/偏少，请改为真实次数）",
         min_value=1,
         max_value=max(1, n_auto * 2),
         value=n_auto,
         step=1,
         key="actual_shots",
-        help="系统按弧线、飞行距离、轨迹长度与连贯性给每次识别打分，保留最像真实投篮的前 N 次。",
+        help="系统按弧线、飞行距离、轨迹长度与连贯性给每次识别打分，自动保留最像真实投篮的前 N 次。",
     )
     if actual > n_auto:
         st.warning(f"系统当前只识别到 {n_auto} 次出手，无法匹配 {actual} 次。请检查视频质量或关闭极速模式。")
