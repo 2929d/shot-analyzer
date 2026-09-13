@@ -107,6 +107,33 @@ COURT = dict(
     FT_CIRCLE_R=1.80,        # 罚球圈半径
 )
 
+# calibration.json 模板：用户下载后，把 image_points 改成自己视频里 4 个对应点的像素坐标
+def _calibration_template() -> str:
+    """生成供用户填写的标定文件模板。"""
+    w, l = COURT["COURT_WIDTH"], COURT["COURT_HALF_LEN"]
+    rim_x, rim_y = w / 2.0, COURT["RIM_FROM_BASELINE"]
+    three_y = rim_y + 6.75
+    return json.dumps(
+        {
+            "description": "把视频画面中的 4 个点与球场真实坐标对应起来；坐标系：x 向右（0~15m），y 向中场（0~14m），篮筐在 (7.5, 1.575)",
+            "image_points": [
+                [640, 250],
+                [640, 90],
+                [80, 500],
+                [1200, 500]
+            ],
+            "court_points": [
+                [rim_x, rim_y],
+                [rim_x, three_y],
+                [0.0, 0.0],
+                [w, 0.0]
+            ],
+            "pixels_per_meter": 42.0
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
 # ---- 配色（极简：纯黑/纯白 + 单色蓝 + 细边框，无渐变无阴影）----
 NAV_BG = "#0F172A"          # 深色导航栏（规格固定，不随主题变化）
 ACCENT = "#2563EB"          # 唯一强调色：单色蓝
@@ -2951,16 +2978,50 @@ def run_dashboard() -> None:
         )
     elif ss.get("source", "").startswith("视频："):
         # 只有视频源才显示位置估算提示；模拟数据本身已是示意，不再重复
-        if not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")):
+        calib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
+        if not os.path.exists(calib_path):
             st.markdown(
                 '<div class="sect">'
                 '注：未检测到 calibration.json，出手位置热力图与距离按画面像素比例估算（相对值，'
-                '看趋势足够，并非绝对米数）。这不影响命中率与出手次数的判断；'
-                '如需把距离换算成真实米数，可上传篮球场标定文件 calibration.json'
-                '（含 image_points / court_points 两个字段）。'
+                '看趋势足够，并非绝对米数）。这不影响命中率与出手次数的判断。'
                 '</div>',
                 unsafe_allow_html=True,
             )
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                st.download_button(
+                    "📥 下载标定模板",
+                    data=_calibration_template(),
+                    file_name="calibration_template.json",
+                    mime="application/json",
+                    key="dl_calib_template",
+                )
+            with c2:
+                with st.expander("如何填写并上传 calibration.json"):
+                    st.markdown(
+                        """
+                        1. 在视频里暂停一帧能清楚看到**篮筐 + 三分线 + 两侧底线**的画面。
+                        2. 用截图工具读出 4 个对应点的 **像素坐标** `[x, y]`：
+                           - 篮筐中心
+                           - 三分线弧顶（正对篮筐）
+                           - 左侧底线角
+                           - 右侧底线角
+                        3. 把 `image_points` 里的 4 个坐标替换成你读出的像素值；`court_points` 保持默认米数。
+                        4. 保存为 `calibration.json`，上传到 GitHub 仓库根目录（和 shot_analyzer.py 同级）。
+                        5. 回到本应用，点 **Manage app → Reboot** 即可生效。
+                        """
+                    )
+        else:
+            try:
+                cfg = json.load(open(calib_path, "r", encoding="utf-8"))
+                src = np.array(cfg.get("image_points", []), float)
+                dst = np.array(cfg.get("court_points", []), float)
+                if src.shape[0] < 4 or src.shape != dst.shape:
+                    st.warning("calibration.json 格式不对：image_points 与 court_points 必须各有至少 4 个对应点。请重新下载模板填写。")
+                else:
+                    st.success(f"✅ 已加载 calibration.json（{src.shape[0]} 个标定点），距离与热力图按真实米数显示。")
+            except Exception as e:
+                st.warning(f"calibration.json 解析失败：{e}。请重新下载模板填写。")
 
     figs = build_all_figures(ds)
     for row in range(3):
