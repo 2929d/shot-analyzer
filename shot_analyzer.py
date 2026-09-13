@@ -1502,6 +1502,7 @@ class VideoShotPipeline:
 
     MIN_SEGMENT = 6          # 一个投篮段最少帧数
     MAX_GAP = 6              # 允许的最大空帧间隔
+    MERGE_GAP = 18           # 约 0.6s：球短暂丢失造成的同一投篮被拆成两段时，合并回去
 
     def __init__(self, calib: Optional[CourtCalibration] = None):
         self.calib = calib or CourtCalibration()
@@ -1525,14 +1526,33 @@ class VideoShotPipeline:
         return segs
 
     @staticmethod
-    def _is_real_shot(seg: List[Tuple[int, float, float, float, float]]) -> bool:
-        """过滤掉"伪出手"：球被短暂检测到但并没有真正投出（橙色干扰、静止的球、晃动等）。
+    def _merge_segments(segs: List[List[Tuple[int, float, float]]]) -> List[List[Tuple[int, float, float]]]:
+        """把因球短暂丢失而被拆成两段的同一投篮合并回去。
 
-        真实投篮的球心轨迹满足以下任一组合即可：
-          * 有明显的弧顶（先上升后下落，存在局部最小）——典型抛物线；
-          * 或整体竖直起跳明显（球从手飞向篮筐，竖直跨度 >= 10% 画面高）。
-        两种情形都要求球确实在画面中明显移动（排除静止的球/细微抖动）。
-        这样即使弧线较平（近距离、出手点高）也不会被误判成"单调漂移"而漏算。
+        仅当两段间隔 <= MERGE_GAP（约 0.6s）时合并——真正的两次投篮之间
+        通常有数秒的拿球/复位时间，不会被误并。
+        """
+        merged: List[List[Tuple[int, float, float]]] = []
+        for s in segs:
+            if merged and (s[0][0] - merged[-1][-1][0]) <= VideoShotPipeline.MERGE_GAP:
+                merged[-1].extend(s)
+            else:
+                merged.append(list(s))
+        return merged
+
+    @staticmethod
+    def _is_real_shot(seg: List[Tuple[int, float, float, float, float]]) -> bool:
+        """过滤掉"伪出手"：运球、拍球、手臂/衣服的橙色干扰、静止的球等。
+
+        核心物理判别：**真正的投篮，球必须从手中的低处飞向高处的篮筐，
+        弧顶（画面最高处）必须接近画面上部**；而运球/拍球/手臂摆动大多
+        停留在画面中下部，弧顶较低，据此排除。
+
+        判定规则（归一化坐标 y 向下，0=画面上沿，1=画面下沿）：
+          * 弧顶必须够高：min(v) < 0.50（球确实飞到画面上半部，接近筐）；
+          * 且（竖直行程明显 vspan>=0.12，或存在清晰抛物线凹性）；
+        这样运球（apex 低、即便有上下起伏）一律被拒，平弧线远投
+        （apex 高、vspan 较小但确实飞向筐）仍被正确保留。
         """
         if len(seg) < VideoShotPipeline.MIN_SEGMENT:
             return False
@@ -1543,13 +1563,15 @@ class VideoShotPipeline:
         # 基本没移动：球基本静止或被短暂当球，直接丢弃
         if vspan < 0.04 and uspan < 0.04:
             return False
-        # 弧顶（凹性）：序列中存在局部最小（中间比两侧更靠上），允许平弧线也带一点弧度
+        min_v = float(v.min())             # 弧顶（画面最高处，y 最小）
+        apex_high = min_v < 0.50           # 球飞到了画面上半部（接近篮筐高度）
+        big_rise = vspan >= 0.12           # 有明显竖直行程（从出手点到筐）
         concave = False
         if len(v) >= 5:
             d2 = v[2:] - 2.0 * v[1:-1] + v[:-2]
             concave = bool(np.any(d2 > 0.0015))
-        # 真实投篮：有明显弧顶，或整体竖直起跳明显（近距离平弧线也能识别）
-        return concave or vspan >= 0.10
+        # 必须弧顶够高；在此基础上要么行程明显，要么呈清晰抛物线
+        return apex_high and (big_rise or concave)
 
     def process(self, data: bytes,
                 progress: Optional[Callable[[float, str], None]] = None,
@@ -1659,7 +1681,9 @@ class VideoShotPipeline:
             raise RuntimeError("未在视频中稳定追踪到球体")
 
         segs = self._segment(detections)
-        # 过滤伪出手：球被短暂检测到但没有真正投出（橙色干扰/静止球/晃动），避免多算出手次数
+        # 先合并因球短暂丢失而被拆分的同一投篮，再做伪出手过滤
+        segs = self._merge_segments(segs)
+        # 过滤伪出手：运球/拍球/橙色干扰/静止球（弧顶不够高或没真正飞向筐），避免多算出手次数
         segs = [s for s in segs if self._is_real_shot(s)]
         records: List[ShotRecord] = []
         n_seg = max(len(segs), 1)
