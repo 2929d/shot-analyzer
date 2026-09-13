@@ -2563,6 +2563,8 @@ def run_dashboard() -> None:
             ss["source"] = "模拟演示"
             ss["meta"] = {}
             ss["video_pairs"] = []
+            for k in [x for x in ss.keys() if x.startswith("keep_")]:
+                del ss[k]
 
     if run_btn:
         # 优先处理已加入列表的视频；列表为空时退回当前上传器选中的视频
@@ -2606,6 +2608,8 @@ def run_dashboard() -> None:
                 ss["source"] = f"视频：{n} 个文件，共 {len(all_records)} 次出手"
                 ss["meta"] = {"frames": int(meta.get("frames", 0))}
                 ss["video_pairs"] = pairs
+                for k in [x for x in ss.keys() if x.startswith("keep_")]:
+                    del ss[k]
             else:
                 # 不再静默 fallback 到假数据，避免误导用户
                 ss["records"] = []
@@ -2632,8 +2636,34 @@ def run_dashboard() -> None:
         st.info("暂无数据。上传真实视频并点「开始分析」，或打开「模拟数据演示」查看示例图表。")
         return
 
-    # ---------------- 数据与图表 ----------------
-    ds = ShotDataset(ss["records"])
+    # ---------------- 逐球确认（手动剔除误识别的出手） ----------------
+    recs = ss["records"]
+    st.markdown(
+        '<div class="sect">逐球确认出手次数（系统自动识别，若把干扰误判为出手，'
+        '请取消对应「保留」；最终统计只计入勾选的出手）</div>',
+        unsafe_allow_html=True,
+    )
+    kept: List[ShotRecord] = []
+    for i, rec in enumerate(recs):
+        key = f"keep_{i}"
+        if key not in ss:
+            ss[key] = True
+        c1, c2 = st.columns([1, 6])
+        with c1:
+            keep = st.checkbox("保留", value=ss[key], key=key)
+        with c2:
+            verdict = "命中 ✅" if rec.made else "未中 ❌"
+            st.caption(
+                f"第 {i + 1} 次：出手高度 {rec.height:.2f} m ｜ 距离 {rec.distance:.1f} m ｜ {verdict}"
+            )
+        if keep:
+            kept.append(rec)
+    if not kept:
+        st.warning("已全部取消，统计与图表为空。请至少保留一次真实出手。")
+        return
+
+    # ---------------- 数据与图表（仅基于确认的出手） ----------------
+    ds = ShotDataset(kept)
     _render_nav(ds.n, int(ds.made.sum()), float(ds.made.mean()) if ds.n else 0.0)
 
     if ss.get("source") == "模拟演示":
@@ -2649,8 +2679,10 @@ def run_dashboard() -> None:
         if not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")):
             st.markdown(
                 '<div class="sect">'
-                '位置提示：未检测到 calibration.json，热力图与距离按默认像素比例估算，'
-                '如需绝对米数，请在仓库根目录上传包含 image_points / court_points 的校准文件。'
+                '注：未检测到 calibration.json，出手位置热力图与距离按画面像素比例估算（相对值，'
+                '看趋势足够，并非绝对米数）。这不影响命中率与出手次数的判断；'
+                '如需把距离换算成真实米数，可上传篮球场标定文件 calibration.json'
+                '（含 image_points / court_points 两个字段）。'
                 '</div>',
                 unsafe_allow_html=True,
             )
