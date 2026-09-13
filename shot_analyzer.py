@@ -1514,6 +1514,88 @@ def _store_downscaled(store: Dict[int, "np.ndarray"], keys: List[int],
         store.pop(old, None)
 
 
+class RimDetector:
+    """基于颜色（橙色篮圈/篮网）+ Hough 圆检测篮筐位置。
+
+    对视频前 N 帧采样，保留稳定出现在画面上半部的橙色圆作为篮筐。
+    若检测失败（角度太远、篮筐不清晰），返回 None，调用方应回退到几何判定。
+    """
+
+    @staticmethod
+    def detect(cap: "cv2.VideoCapture", max_frames: int = 80) -> Optional[Tuple[float, float, float]]:
+        """返回篮筐 (u_norm, v_norm, radius_norm)，None 表示未检出。"""
+        if not CV2_OK:
+            return None
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if fw <= 0 or fh <= 0:
+            return None
+        candidates: List[Tuple[float, float, float]] = []
+        step = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or max_frames) // max_frames)
+        saved_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        for i in range(max_frames):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            rim = RimDetector._detect_single(frame, fw, fh)
+            if rim is not None:
+                candidates.append(rim)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, saved_pos)
+        if not candidates:
+            return None
+        # 简单聚类：按 v 坐标排序，取最密集的一簇（篮筐通常在画面上半部稳定出现）
+        arr = np.array(candidates, float)
+        # 过滤掉太靠下的候选（大概率不是筐）
+        upper = arr[arr[:, 1] < 0.65]
+        if len(upper) == 0:
+            upper = arr
+        if len(upper) < 3:
+            med = np.median(upper, axis=0)
+        else:
+            # 取 v 最密集区域的中位数
+            vs = upper[:, 1]
+            q25, q75 = np.percentile(vs, [25, 75])
+            cluster = upper[(vs >= q25) & (vs <= q75)]
+            med = np.median(cluster if len(cluster) >= 3 else upper, axis=0)
+        return float(med[0]), float(med[1]), float(med[2])
+
+    @staticmethod
+    def _detect_single(frame: "np.ndarray", fw: int, fh: int) -> Optional[Tuple[float, float, float]]:
+        small = cv2.resize(frame, (min(fw, 640), min(fh, 360)))
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        # 橙色篮圈：覆盖常见橙/红橙范围
+        mask1 = cv2.inRange(hsv, np.array([5, 80, 80], np.uint8), np.array([18, 255, 255], np.uint8))
+        mask2 = cv2.inRange(hsv, np.array([160, 80, 80], np.uint8), np.array([180, 255, 255], np.uint8))
+        mask = cv2.bitwise_or(mask1, mask2)
+        # 形态学去噪
+        k = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        circles = cv2.HoughCircles(
+            gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=small.shape[1] // 5,
+            param1=80, param2=26, minRadius=6, maxRadius=max(6, min(small.shape[:2]) // 5)
+        )
+        if circles is None:
+            return None
+        best: Optional[Tuple[float, float, float, float]] = None
+        for x, y, r in circles[0]:
+            xi, yi = int(x), int(y)
+            if 0 <= yi < mask.shape[0] and 0 <= xi < mask.shape[1] and mask[yi, xi] > 0:
+                # 篮筐应在画面上半部，半径不能太大
+                v_norm = y / small.shape[0]
+                r_norm = r / small.shape[1]
+                if v_norm > 0.70 or r_norm > 0.18:
+                    continue
+                score = r * mask[yi, xi] / 255.0 - 100.0 * v_norm
+                if best is None or score > best[3]:
+                    best = (x / small.shape[1], y / small.shape[0], r / small.shape[1], score)
+        if best is None:
+            return None
+        return best[0], best[1], best[2]
+
+
 class VideoShotPipeline:
     """端到端视频分析：读视频 -> 帧差分跟踪 -> 分段 -> 反演 -> 相位分析 -> 弹道判定。
 
@@ -1596,6 +1678,52 @@ class VideoShotPipeline:
         # 必须弧顶够高；在此基础上要么行程明显，要么呈清晰抛物线
         return apex_high and (big_rise or concave)
 
+    @staticmethod
+    def _judge_made(uv: np.ndarray,
+                    rim: Optional[Tuple[float, float, float]]) -> bool:
+        """判定一次出手是否进球。
+
+        若检测到真实篮筐 rim=(u,v,r)，优先用几何穿越判定：
+          * 轨迹末段（后 40%）存在点落在篮筐半径 1.7 倍范围内；
+          * 且该点前后球正在下落（v 增大）；
+          * 且弧顶高于筐位（球确实从上方接近筐）。
+        满足则判进，否则判不进（宁可漏判也不乱判进）。
+
+        若未检测到 rim，回退到旧的"弧线是否够到筐高"估算。
+        """
+        if uv.shape[0] < 3:
+            return False
+        if rim is not None:
+            ru, rv, rr = rim
+            n = uv.shape[0]
+            tail_start = max(0, int(n * 0.4))
+            tail_u = uv[tail_start:, 0]
+            tail_v = uv[tail_start:, 1]
+            if tail_u.size == 0:
+                tail_u, tail_v = uv[:, 0], uv[:, 1]
+            # 轨迹末段是否穿过篮筐区域
+            du = tail_u - ru
+            dv = tail_v - rv
+            dist = np.sqrt(du * du + dv * dv)
+            in_rim = dist < rr * 1.7
+            if not np.any(in_rim):
+                return False
+            # 在穿筐时刻前后，球应处于下落状态（v 增大）
+            hit_idx = tail_start + int(np.argmin(dist))
+            if hit_idx >= 1 and hit_idx < uv.shape[0] - 1:
+                descending = float(uv[hit_idx + 1, 1]) > float(uv[hit_idx - 1, 1])
+            else:
+                descending = True
+            # 弧顶必须高于筐（球从上方来）
+            apex_high = float(uv[:, 1].min()) < (rv + rr * 1.5)
+            return bool(np.any(in_rim) and descending and apex_high)
+
+        # 无篮筐检测时的几何回退：弧线峰值达到筐高 3.048m 附近
+        peak_idx = int(np.argmin(uv[:, 1]))
+        scale_guess = 3.0  # 归一化高度 -> 米的粗略尺度（仅用于 fallback）
+        peak_h = (float(uv[0, 1]) - float(uv[peak_idx, 1])) * scale_guess
+        return bool(peak_h >= (FlightModel.RIM_H - 0.15))
+
     def process(self, data: bytes,
                 progress: Optional[Callable[[float, str], None]] = None,
                 enable_overlay: bool = True,
@@ -1619,6 +1747,9 @@ class VideoShotPipeline:
         total = total if total > 0 else 600
         fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+        # ---- 篮筐检测（可选）：如果能看到橙色篮圈，就用真实筐位判定进/不进 ----
+        rim = RimDetector.detect(cap, max_frames=60)
 
         # ---- 叠加视频写入器：只写有球跟踪的片段，避免整段视频逐帧编码拖慢 ----
         overlay_path = os.path.join(tempfile.gettempdir(), f"shot_overlay_{uuid.uuid4().hex}.mp4")
@@ -1713,7 +1844,7 @@ class VideoShotPipeline:
         for k, seg in enumerate(segs):
             if progress:
                 progress(0.45 + 0.5 * (k + 1) / n_seg, f"正在反演第 {k + 1} 次出手")
-            rec = self._analyze_segment(seg, fps, frame_store)
+            rec = self._analyze_segment(seg, fps, frame_store, rim=rim)
             if rec is not None:
                 rec.idx = len(records) + 1
                 records.append(rec)
@@ -1755,9 +1886,14 @@ class VideoShotPipeline:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
     def _analyze_segment(self, seg: List[Tuple[int, float, float, float, float]],
-                         fps: float, frame_store: Dict[int, np.ndarray]
+                         fps: float, frame_store: Dict[int, np.ndarray],
+                         rim: Optional[Tuple[float, float, float]] = None
                          ) -> Optional[ShotRecord]:
-        """对一次出手做完整反演：自标定 -> 联合最小二乘 -> 弹道判定 -> 相位分析。"""
+        """对一次出手做完整反演：自标定 -> 联合最小二乘 -> 弹道判定 -> 相位分析。
+
+        若传入了 rim（篮筐归一化位置与半径），则优先用真实筐位判定进/不进；
+        否则回退到基于弧线几何的估算。
+        """
         uv = np.array([[s[1], s[2]] for s in seg], float)
         times = np.array([s[0] for s in seg], float) / float(fps)
         if uv.shape[0] < self.MIN_SEGMENT:
@@ -1787,12 +1923,10 @@ class VideoShotPipeline:
         entry = float(res["entry_angle"]) if np.isfinite(res["entry_angle"]) else 42.0
         err = clamp(float(abs(res["cross_x"]) * 100.0) if np.isfinite(res["cross_x"]) else 50.0, 0, 120)
 
-        # 6) 诚实的"进/不进"判定：用被追踪到的真实弧线是否够到筐高（篮筐 3.048 m）。
-        #    球被追踪到接近或高于筐高 = 进；明显够不到（投短/砸前筐） = 不进。
-        #    这是基于视频的直接几何证据，而非拟合弹道的循环论证，因此能正确识别"不进"。
-        peak_idx = int(np.argmin(uv[:, 1]))                       # 弧顶帧（图像 v 最小 = 画面最高）
-        peak_h = height + (float(uv[0, 1]) - float(uv[peak_idx, 1])) * rp.scale
-        made = bool(peak_h >= (FlightModel.RIM_H - 0.15))
+        # 6) 诚实的"进/不进"判定：优先用检测到的真实篮筐位置。
+        #    若能看到橙色篮圈：球在轨迹末段向下运动并进入篮筐区域 -> 进；明显偏出 -> 不进。
+        #    若检测不到篮筐：回退到"弧线是否够到筐高"的几何估算。
+        made = self._judge_made(uv, rim)
 
         # 6) 髋肩关节时序与相位相干性
         seg_frames = [frame_store[s[0]] for s in seg if s[0] in frame_store]
