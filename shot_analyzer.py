@@ -1544,7 +1544,8 @@ class RimDetector:
         cap.set(cv2.CAP_PROP_POS_FRAMES, saved_pos)
         if not candidates:
             return None
-        # 简单聚类：按 v 坐标排序，取最密集的一簇（篮筐通常在画面上半部稳定出现）
+        # 空间投票聚类：静止篮筐会在多帧出现在同一 (u,v)，运动小球分散。
+        # 先在 2D 网格里找票数最多的格子，再取该格子的中位数作为筐位。
         arr = np.array(candidates, float)
         # 过滤掉太靠下的候选（大概率不是筐）
         upper = arr[arr[:, 1] < 0.65]
@@ -1553,15 +1554,25 @@ class RimDetector:
         if len(upper) < 3:
             med = np.median(upper, axis=0)
         else:
-            # 取 v 最密集区域的中位数
-            vs = upper[:, 1]
-            q25, q75 = np.percentile(vs, [25, 75])
-            cluster = upper[(vs >= q25) & (vs <= q75)]
-            med = np.median(cluster if len(cluster) >= 3 else upper, axis=0)
+            best_count = 0
+            best_mask = np.zeros(len(upper), bool)
+            # 10x10 归一化网格
+            for i in range(10):
+                for j in range(10):
+                    u0, u1 = i / 10.0, (i + 1) / 10.0
+                    v0, v1 = j / 10.0, (j + 1) / 10.0
+                    mask = ((upper[:, 0] >= u0) & (upper[:, 0] < u1) &
+                            (upper[:, 1] >= v0) & (upper[:, 1] < v1))
+                    if mask.sum() > best_count:
+                        best_count = int(mask.sum())
+                        best_mask = mask
+            cluster = upper[best_mask] if best_count >= 2 else upper
+            med = np.median(cluster, axis=0)
         return float(med[0]), float(med[1]), float(med[2])
 
     @staticmethod
     def _detect_single(frame: "np.ndarray", fw: int, fh: int) -> Optional[Tuple[float, float, float]]:
+        """在单帧中检测篮筐。先用 HSV 橙色 mask + 轮廓圆度找篮圈；失败时 fallback 到 Hough 圆。"""
         small = cv2.resize(frame, (min(fw, 640), min(fh, 360)))
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         # 橙色篮圈：覆盖常见橙/红橙范围
@@ -1572,25 +1583,51 @@ class RimDetector:
         k = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        circles = cv2.HoughCircles(
-            gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=small.shape[1] // 5,
-            param1=80, param2=26, minRadius=6, maxRadius=max(6, min(small.shape[:2]) // 5)
-        )
-        if circles is None:
-            return None
+
+        def _is_valid(x: float, y: float, r: float) -> bool:
+            v_norm = y / small.shape[0]
+            r_norm = r / small.shape[1]
+            return v_norm < 0.70 and r_norm < 0.18 and r_norm > 0.01
+
         best: Optional[Tuple[float, float, float, float]] = None
-        for x, y, r in circles[0]:
-            xi, yi = int(x), int(y)
-            if 0 <= yi < mask.shape[0] and 0 <= xi < mask.shape[1] and mask[yi, xi] > 0:
-                # 篮筐应在画面上半部，半径不能太大
-                v_norm = y / small.shape[0]
-                r_norm = r / small.shape[1]
-                if v_norm > 0.70 or r_norm > 0.18:
-                    continue
-                score = r * mask[yi, xi] / 255.0 - 100.0 * v_norm
-                if best is None or score > best[3]:
-                    best = (x / small.shape[1], y / small.shape[0], r / small.shape[1], score)
+
+        # 方案 A：在橙色 mask 上找轮廓，筛选圆度高的区域（篮圈是圆环，mask 上呈 C 形/圆斑）
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            if area < 80.0:
+                continue
+            peri = float(cv2.arcLength(cnt, True))
+            if peri < 1e-6:
+                continue
+            circularity = 4.0 * math.pi * area / (peri * peri)
+            if circularity < 0.50:
+                continue
+            (x, y), radius = cv2.minEnclosingCircle(cnt)
+            if not _is_valid(x, y, radius):
+                continue
+            # 圆度越高、半径越大，分数越高；位置越靠上，略加分
+            score = circularity * 100.0 + radius * 2.0 - y * 0.5
+            if best is None or score > best[3]:
+                best = (x / small.shape[1], y / small.shape[0], radius / small.shape[1], score)
+
+        # 方案 B（fallback）：在灰度图上用 Hough 圆，要求圆心落在橙色 mask 上
+        if best is None:
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            circles = cv2.HoughCircles(
+                gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=small.shape[1] // 5,
+                param1=80, param2=26, minRadius=6, maxRadius=max(6, min(small.shape[:2]) // 5)
+            )
+            if circles is not None:
+                for x, y, r in circles[0]:
+                    xi, yi = int(x), int(y)
+                    if 0 <= yi < mask.shape[0] and 0 <= xi < mask.shape[1] and mask[yi, xi] > 0:
+                        if not _is_valid(x, y, r):
+                            continue
+                        score = r * 3.0 - y * 0.5
+                        if best is None or score > best[3]:
+                            best = (x / small.shape[1], y / small.shape[0], r / small.shape[1], score)
+
         if best is None:
             return None
         return best[0], best[1], best[2]
