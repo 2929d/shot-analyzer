@@ -1199,6 +1199,22 @@ class DemoDataFactory:
         return records
 
 
+def _demo_records(n: int = 36) -> List[ShotRecord]:
+    """生成模拟投篮数据（供「模拟数据演示」使用）。"""
+    return DemoDataFactory(seed=20260903).generate(n)
+
+
+_cached_demo_fn: Optional[Callable[[int], List[ShotRecord]]] = None
+
+
+def _get_demo_records(n: int = 36) -> List[ShotRecord]:
+    """懒加载缓存版模拟数据。Streamlit 下只生成一次并缓存；命令行/自检直接生成。"""
+    global _cached_demo_fn
+    if _cached_demo_fn is None:
+        _cached_demo_fn = st.cache_data(ttl=3600)(_demo_records) if _under_streamlit() else _demo_records
+    return _cached_demo_fn(n)
+
+
 # ==============================================================================
 #  8. 视频分析管线（真实视频：帧差分 + 姿态；异常时降级到模拟数据）
 # ==============================================================================
@@ -2566,8 +2582,12 @@ def run_dashboard() -> None:
     with c1:
         run_btn = st.button("开始分析", use_container_width=True, type="primary")
     with c2:
-        demo_toggle = st.toggle("模拟数据演示",
-                                value=(ss["records"] is None and not ss["video_pairs"]))
+        demo_toggle = st.toggle(
+            "模拟数据演示",
+            value=False,
+            key="demo_mode",
+            help="开启后生成 36 条示例投篮数据用于展示图表；分析真实视频时请保持关闭。",
+        )
     with c3:
         meta_txt = ""
         frame_ms = float(ss["meta"].get("frame_ms", 0.0) or 0.0)
@@ -2608,7 +2628,7 @@ def run_dashboard() -> None:
     # 仅当用户明确打开「模拟数据演示」且没有点「开始分析」时才生成演示数据
     if demo_toggle and not run_btn:
         with st.spinner("正在生成模拟投篮数据"):
-            ss["records"] = DemoDataFactory().generate(60)
+            ss["records"] = _get_demo_records(36)
             ss["source"] = "模拟演示"
             ss["meta"] = {}
             ss["video_pairs"] = []
@@ -2811,7 +2831,7 @@ def _selftest() -> int:
     print(f"      低协调：相位锁定值 {bad['plv']:.3f} | DTW {bad['dtw']:.2f}")
 
     print("[4/6] 高斯过程 + 帕累托前沿")
-    records = DemoDataFactory().generate(60)
+    records = _get_demo_records(36)
     ds = ShotDataset(records)
     pr = ds.pareto_result
     print(f"      样本 {ds.n} 投，命中 {int(ds.made.sum())} 投 "
