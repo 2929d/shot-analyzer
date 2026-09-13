@@ -1082,6 +1082,7 @@ class ShotRecord:
     dtw: float = 8.0            # 髋肩时序 DTW 距离（归一化）
     phase_lag: float = 0.0      # 平均相位差（度）
     stability: float = 70.0     # 稳定性得分（0~100）
+    confidence: float = 0.0     # 该出手为真实投篮的置信度（0~1）
     curve_t: np.ndarray = field(default_factory=lambda: np.linspace(0, 100, 64))
     curve_shoulder: np.ndarray = field(default_factory=lambda: np.zeros(64))
     curve_hip: np.ndarray = field(default_factory=lambda: np.zeros(64))
@@ -1184,7 +1185,7 @@ class DemoDataFactory:
                     entry=entry, error_cm=err, speed_err=speed - v_ideal,
                     plv=float(ph["plv"]), coherence=float(ph["coherence"]),
                     dtw=float(ph["dtw"]) if np.isfinite(ph["dtw"]) else 10.0,
-                    phase_lag=float(ph["mean_phase_lag"]),
+                    phase_lag=float(ph["mean_phase_lag"]), confidence=1.0,
                     curve_t=np.linspace(0, 100, hip.size),
                     curve_shoulder=shoulder, curve_hip=hip,
                 )
@@ -1758,13 +1759,37 @@ class VideoShotPipeline:
         # 7) 出手位置（热力图用）：优先用标定文件的单应矩阵，否则按三分线弧顶近似摆放
         x_court, y_depth = self._floor_location(uv, rp, distance)
 
+        # 8) 置信度：综合弧线跨度、飞行距离、段长度、连贯性，用于 UI 自动精选真实出手
+        vv = uv[:, 1]
+        uu = uv[:, 0]
+        vspan = float(vv.max() - vv.min())
+        uspan = float(abs(uu[-1] - uu[0]))
+        n_pts = uv.shape[0]
+        if n_pts >= 3:
+            diffs = np.sqrt(np.sum((uv[1:] - uv[:-1]) ** 2, axis=1))
+            cv_disp = float(np.std(diffs) / (np.mean(diffs) + 1e-6))
+        else:
+            cv_disp = 1.0
+        concave = False
+        if n_pts >= 5:
+            d2 = vv[2:] - 2.0 * vv[1:-1] + vv[:-2]
+            concave = bool(np.any(d2 > 0.0015))
+        conf = (
+            0.25 * min(vspan / 0.20, 1.0)
+            + 0.20 * min(uspan / 0.30, 1.0)
+            + 0.20 * min(n_pts / 15.0, 1.0)
+            + 0.20 * (1.0 if concave else 0.5)
+            + 0.15 * max(0.0, 1.0 - cv_disp)
+        )
+        confidence = clamp(conf, 0.0, 1.0)
+
         return ShotRecord(
             idx=0, x_court=x_court, y_depth=y_depth, distance=distance,
             height=height, speed=rp.speed, angle=rp.angle_deg, spin=spin_rps,
             made=made, apex=apex, entry=entry, error_cm=err, speed_err=rp.speed - v_ideal,
             plv=float(ph["plv"]), coherence=float(ph["coherence"]),
             dtw=float(ph["dtw"]) if np.isfinite(ph["dtw"]) else 10.0,
-            phase_lag=float(ph["mean_phase_lag"]),
+            phase_lag=float(ph["mean_phase_lag"]), confidence=confidence,
             curve_t=np.linspace(0, 100, hip.size), curve_hip=hip, curve_shoulder=sh,
         )
 
@@ -2563,8 +2588,7 @@ def run_dashboard() -> None:
             ss["source"] = "模拟演示"
             ss["meta"] = {}
             ss["video_pairs"] = []
-            for k in [x for x in ss.keys() if x.startswith("keep_")]:
-                del ss[k]
+            ss.pop("actual_shots", None)
 
     if run_btn:
         # 优先处理已加入列表的视频；列表为空时退回当前上传器选中的视频
@@ -2608,8 +2632,7 @@ def run_dashboard() -> None:
                 ss["source"] = f"视频：{n} 个文件，共 {len(all_records)} 次出手"
                 ss["meta"] = {"frames": int(meta.get("frames", 0))}
                 ss["video_pairs"] = pairs
-                for k in [x for x in ss.keys() if x.startswith("keep_")]:
-                    del ss[k]
+                ss.pop("actual_shots", None)
             else:
                 # 不再静默 fallback 到假数据，避免误导用户
                 ss["records"] = []
@@ -2636,33 +2659,26 @@ def run_dashboard() -> None:
         st.info("暂无数据。上传真实视频并点「开始分析」，或打开「模拟数据演示」查看示例图表。")
         return
 
-    # ---------------- 逐球确认（手动剔除误识别的出手） ----------------
+    # ---------------- 数据与图表 ----------------
     recs = ss["records"]
-    st.markdown(
-        '<div class="sect">逐球确认出手次数（系统自动识别，若把干扰误判为出手，'
-        '请取消对应「保留」；最终统计只计入勾选的出手）</div>',
-        unsafe_allow_html=True,
-    )
-    kept: List[ShotRecord] = []
-    for i, rec in enumerate(recs):
-        key = f"keep_{i}"
-        if key not in ss:
-            ss[key] = True
-        c1, c2 = st.columns([1, 6])
-        with c1:
-            keep = st.checkbox("保留", value=ss[key], key=key)
-        with c2:
-            verdict = "命中 ✅" if rec.made else "未中 ❌"
-            st.caption(
-                f"第 {i + 1} 次：出手高度 {rec.height:.2f} m ｜ 距离 {rec.distance:.1f} m ｜ {verdict}"
-            )
-        if keep:
-            kept.append(rec)
-    if not kept:
-        st.warning("已全部取消，统计与图表为空。请至少保留一次真实出手。")
-        return
 
-    # ---------------- 数据与图表（仅基于确认的出手） ----------------
+    # 系统按置信度自动保留最像真实投篮的前 N 段；用户只需改一个数字即可校正出手次数
+    n_auto = len(recs)
+    actual = st.number_input(
+        "实际出手次数（若系统识别偏多/偏少，请改为真实次数；自动保留置信度最高的出手）",
+        min_value=1,
+        max_value=max(1, n_auto * 2),
+        value=n_auto,
+        step=1,
+        key="actual_shots",
+        help="系统按弧线、飞行距离、轨迹长度与连贯性给每次识别打分，保留最像真实投篮的前 N 次。",
+    )
+    if actual > n_auto:
+        st.warning(f"系统当前只识别到 {n_auto} 次出手，无法匹配 {actual} 次。请检查视频质量或关闭极速模式。")
+    if actual < n_auto:
+        st.info(f"已按置信度自动保留前 {actual} 次，剔除 {n_auto - actual} 次低置信度识别。")
+    kept = sorted(recs, key=lambda r: r.confidence, reverse=True)[:actual]
+
     ds = ShotDataset(kept)
     _render_nav(ds.n, int(ds.made.sum()), float(ds.made.mean()) if ds.n else 0.0)
 
