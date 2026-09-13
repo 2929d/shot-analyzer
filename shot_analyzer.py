@@ -1211,7 +1211,14 @@ def _get_demo_records(n: int = 36) -> List[ShotRecord]:
     """懒加载缓存版模拟数据。Streamlit 下只生成一次并缓存；命令行/自检直接生成。"""
     global _cached_demo_fn
     if _cached_demo_fn is None:
-        _cached_demo_fn = st.cache_data(ttl=3600)(_demo_records) if _under_streamlit() else _demo_records
+        if _under_streamlit():
+            try:
+                _cached_demo_fn = st.cache_data(ttl=3600)(_demo_records)
+            except Exception:
+                # 缓存初始化失败（环境差异）时降级为直接生成，保证演示开关始终可用
+                _cached_demo_fn = _demo_records
+        else:
+            _cached_demo_fn = _demo_records
     return _cached_demo_fn(n)
 
 
