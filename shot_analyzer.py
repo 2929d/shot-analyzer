@@ -1527,10 +1527,11 @@ class VideoShotPipeline:
     def _is_real_shot(seg: List[Tuple[int, float, float, float, float]]) -> bool:
         """过滤掉"伪出手"：球被短暂检测到但并没有真正投出（橙色干扰、静止的球、晃动等）。
 
-        真实投篮的球心轨迹必须同时具备：
-          * 足够的竖直跨度（球明显起跳，>= 10% 画面高度）；
-          * 一定的水平位移（球飞向篮筐，>= 4% 画面宽度）；
-          * 明显的弧顶（先上升后下落，峰值不在两端）——单调漂移不是投篮。
+        真实投篮的球心轨迹满足以下任一组合即可：
+          * 有明显的弧顶（先上升后下落，存在局部最小）——典型抛物线；
+          * 或整体竖直起跳明显（球从手飞向篮筐，竖直跨度 >= 10% 画面高）。
+        两种情形都要求球确实在画面中明显移动（排除静止的球/细微抖动）。
+        这样即使弧线较平（近距离、出手点高）也不会被误判成"单调漂移"而漏算。
         """
         if len(seg) < VideoShotPipeline.MIN_SEGMENT:
             return False
@@ -1538,14 +1539,16 @@ class VideoShotPipeline:
         v = np.array([s[2] for s in seg], float)
         vspan = float(v.max() - v.min())   # 归一化竖直跨度（图像 y 向下，值越大越靠下）
         uspan = float(u.max() - u.min())
-        if vspan < 0.10:
+        # 基本没移动：球基本静止或被短暂当球，直接丢弃
+        if vspan < 0.04 and uspan < 0.04:
             return False
-        if uspan < 0.04:
-            return False
-        k = int(np.argmin(v))              # 弧顶帧（v 最小 = 画面最高）
-        if k <= 0 or k >= len(v) - 1:      # 峰值贴在两端 = 单调漂移，不是投篮
-            return False
-        return True
+        # 弧顶（凹性）：序列中存在局部最小（中间比两侧更靠上），允许平弧线也带一点弧度
+        concave = False
+        if len(v) >= 5:
+            d2 = v[2:] - 2.0 * v[1:-1] + v[:-2]
+            concave = bool(np.any(d2 > 0.0015))
+        # 真实投篮：有明显弧顶，或整体竖直起跳明显（近距离平弧线也能识别）
+        return concave or vspan >= 0.10
 
     def process(self, data: bytes,
                 progress: Optional[Callable[[float, str], None]] = None,
