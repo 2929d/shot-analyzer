@@ -1523,6 +1523,30 @@ class VideoShotPipeline:
             segs.append(cur)
         return segs
 
+    @staticmethod
+    def _is_real_shot(seg: List[Tuple[int, float, float, float, float]]) -> bool:
+        """过滤掉"伪出手"：球被短暂检测到但并没有真正投出（橙色干扰、静止的球、晃动等）。
+
+        真实投篮的球心轨迹必须同时具备：
+          * 足够的竖直跨度（球明显起跳，>= 10% 画面高度）；
+          * 一定的水平位移（球飞向篮筐，>= 4% 画面宽度）；
+          * 明显的弧顶（先上升后下落，峰值不在两端）——单调漂移不是投篮。
+        """
+        if len(seg) < VideoShotPipeline.MIN_SEGMENT:
+            return False
+        u = np.array([s[1] for s in seg], float)
+        v = np.array([s[2] for s in seg], float)
+        vspan = float(v.max() - v.min())   # 归一化竖直跨度（图像 y 向下，值越大越靠下）
+        uspan = float(u.max() - u.min())
+        if vspan < 0.10:
+            return False
+        if uspan < 0.04:
+            return False
+        k = int(np.argmin(v))              # 弧顶帧（v 最小 = 画面最高）
+        if k <= 0 or k >= len(v) - 1:      # 峰值贴在两端 = 单调漂移，不是投篮
+            return False
+        return True
+
     def process(self, data: bytes,
                 progress: Optional[Callable[[float, str], None]] = None,
                 enable_overlay: bool = True,
@@ -1631,6 +1655,8 @@ class VideoShotPipeline:
             raise RuntimeError("未在视频中稳定追踪到球体")
 
         segs = self._segment(detections)
+        # 过滤伪出手：球被短暂检测到但没有真正投出（橙色干扰/静止球/晃动），避免多算出手次数
+        segs = [s for s in segs if self._is_real_shot(s)]
         records: List[ShotRecord] = []
         n_seg = max(len(segs), 1)
         for k, seg in enumerate(segs):
@@ -1692,23 +1718,30 @@ class VideoShotPipeline:
 
         # 2) 出手高度：由归一化纵坐标与自标定尺度换算（假设画面底边为地面）
         height = clamp((1.0 - float(uv[0, 1])) * rp.scale, 1.20, 3.60)
-        # 3) 到筐距离：用拟合弹道下降到篮筐高度处的水平位移反推
-        distance, _apex_g, _entry_g = FlightModel.distance_to_rim(
-            rp.speed, rp.angle_deg, rp.spin_rad_s, height
-        )
-        distance = clamp(distance, 1.0, 14.0)
+        # 3) 真实出手距离 = 球在画面中实际水平飞行距离（归一化水平跨度 × 自标定尺度 × 宽高比）。
+        #    注意：以前用"拟合弹道降到筐高的水平位移"反推距离，再把该距离喂回弹道判定，
+        #    形成循环论证，导致只要被识别为出手就必然判"进"。改用真实飞行距离打破该循环。
+        travel = abs(float(uv[-1, 0] - uv[0, 0])) * rp.scale * aspect
+        distance = clamp(travel, 1.0, 14.0)
         rp.height, rp.distance = height, distance
 
         # 4) 旋转速度：稠密光流的最小二乘刚体旋转估计
         spin_rps = self._estimate_spin(frame_store, seg, fps)
 
-        # 5) 完整弹道判定（含阻力与马格努斯升力）
+        # 5) 完整弹道判定（含阻力与马格努斯升力）——仅用于展示入射角/圆心偏差，
+        #    不再作为"进/不进"的唯一依据（否则会被循环论证污染）。
         res = FlightModel.integrate(rp.speed, rp.angle_deg, spin_rps * 2 * math.pi,
-                                    height, distance, rand=0.5)
-        made = bool(res["made"])
+                                    height, distance, rand=None)
         apex = float(res["apex"])
         entry = float(res["entry_angle"]) if np.isfinite(res["entry_angle"]) else 42.0
         err = clamp(float(abs(res["cross_x"]) * 100.0) if np.isfinite(res["cross_x"]) else 50.0, 0, 120)
+
+        # 6) 诚实的"进/不进"判定：用被追踪到的真实弧线是否够到筐高（篮筐 3.048 m）。
+        #    球被追踪到接近或高于筐高 = 进；明显够不到（投短/砸前筐） = 不进。
+        #    这是基于视频的直接几何证据，而非拟合弹道的循环论证，因此能正确识别"不进"。
+        peak_idx = int(np.argmin(uv[:, 1]))                       # 弧顶帧（图像 v 最小 = 画面最高）
+        peak_h = height + (float(uv[0, 1]) - float(uv[peak_idx, 1])) * rp.scale
+        made = bool(peak_h >= (FlightModel.RIM_H - 0.15))
 
         # 6) 髋肩关节时序与相位相干性
         seg_frames = [frame_store[s[0]] for s in seg if s[0] in frame_store]
