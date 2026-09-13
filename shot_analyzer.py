@@ -2939,31 +2939,28 @@ def run_dashboard() -> None:
         st.info(f"已按置信度自动保留前 {actual} 次，剔除 {n_auto - actual} 次低置信度识别。")
     kept = sorted(recs, key=lambda r: r.confidence, reverse=True)[:actual]
 
-    # 逐球校正进/不进（默认用算法/篮筐检测判定，用户可手动翻转）
-    if len(kept) <= 12:
-        st.markdown(
-            '<div style="font-size:15px;font-weight:600;color:#60A5FA;margin:12px 0 4px 0;">'
-            "🎯 校正命中/未中（可选）"
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        st.caption("若算法对某次出手的进/不进判断有误，直接切换开关即可覆盖。")
-        for i, rec in enumerate(kept):
-            key = f"made_override_{i}"
-            if key not in ss:
-                ss[key] = bool(rec.made)
-            c1, c2 = st.columns([1, 5])
-            with c1:
-                override = st.toggle(
-                    "命中",
-                    value=ss[key],
-                    key=key,
-                    label_visibility="collapsed",
-                )
-            with c2:
-                algo_label = "命中 ✅" if rec.made else "未中 ❌"
-                st.caption(f"第 {i + 1} 次：算法判定 {algo_label}")
-            rec.made = bool(override)
+    # 命中次数整体校正（用单个数字输入替代逐条 toggle，避免 widget 过多导致卡顿）
+    st.markdown(
+        '<div style="font-size:15px;font-weight:600;color:#60A5FA;margin:12px 0 4px 0;">'
+        "🎯 校正命中次数（可选）"
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    algo_made = int(sum(1 for r in kept if r.made))
+    actual_made = st.number_input(
+        "实际命中次数（若算法判定有出入，请直接改为真实进球数）",
+        min_value=0,
+        max_value=len(kept),
+        value=algo_made,
+        step=1,
+        key="actual_made",
+        help="系统按篮筐检测 + 弧线落点自动判定每次进/不进。此处只需填总命中数，我们会按置信度保留最可靠的命中判定。",
+    )
+    if actual_made != algo_made:
+        # 按置信度高低保留前 actual_made 次为命中，保证记录稳定、不出现随机跳动
+        kept_sorted = sorted(kept, key=lambda r: r.confidence, reverse=True)
+        for i, rec in enumerate(kept_sorted):
+            rec.made = i < actual_made
 
     ds = ShotDataset(kept)
     _render_nav(ds.n, int(ds.made.sum()), float(ds.made.mean()) if ds.n else 0.0)
