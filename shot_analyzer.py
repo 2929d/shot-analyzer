@@ -2774,6 +2774,8 @@ def run_dashboard() -> None:
             ss["meta"] = {}
             ss["video_pairs"] = []
             ss.pop("actual_shots", None)
+            for k in [x for x in ss.keys() if x.startswith("made_override_")]:
+                del ss[k]
 
     if run_btn:
         # 优先处理已加入列表的视频；列表为空时退回当前上传器选中的视频
@@ -2818,6 +2820,8 @@ def run_dashboard() -> None:
                 ss["meta"] = {"frames": int(meta.get("frames", 0))}
                 ss["video_pairs"] = pairs
                 ss.pop("actual_shots", None)
+                for k in [x for x in ss.keys() if x.startswith("made_override_")]:
+                    del ss[k]
             else:
                 # 不再静默 fallback 到假数据，避免误导用户
                 ss["records"] = []
@@ -2870,6 +2874,32 @@ def run_dashboard() -> None:
     if actual < n_auto:
         st.info(f"已按置信度自动保留前 {actual} 次，剔除 {n_auto - actual} 次低置信度识别。")
     kept = sorted(recs, key=lambda r: r.confidence, reverse=True)[:actual]
+
+    # 逐球校正进/不进（默认用算法/篮筐检测判定，用户可手动翻转）
+    if len(kept) <= 12:
+        st.markdown(
+            '<div style="font-size:15px;font-weight:600;color:#60A5FA;margin:12px 0 4px 0;">'
+            "🎯 校正命中/未中（可选）"
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("若算法对某次出手的进/不进判断有误，直接切换开关即可覆盖。")
+        for i, rec in enumerate(kept):
+            key = f"made_override_{i}"
+            if key not in ss:
+                ss[key] = bool(rec.made)
+            c1, c2 = st.columns([1, 5])
+            with c1:
+                override = st.toggle(
+                    "命中",
+                    value=ss[key],
+                    key=key,
+                    label_visibility="collapsed",
+                )
+            with c2:
+                algo_label = "命中 ✅" if rec.made else "未中 ❌"
+                st.caption(f"第 {i + 1} 次：算法判定 {algo_label}")
+            rec.made = bool(override)
 
     ds = ShotDataset(kept)
     _render_nav(ds.n, int(ds.made.sum()), float(ds.made.mean()) if ds.n else 0.0)
